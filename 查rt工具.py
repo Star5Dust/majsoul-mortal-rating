@@ -1,0 +1,417 @@
+# integrated_pipeline.py
+import os
+import time
+import json
+import requests
+import csv
+from urllib.parse import urlparse, parse_qs
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import re
+
+
+
+
+
+def get_player_id_by_nickname(nickname):
+    """
+    通过昵称获取玩家ID
+    返回: player_id 或 None
+    """
+    print(f"🔍 正在搜索玩家: {nickname}")
+
+    USER_DATA_DIR = os.path.abspath("./chrome_user_data_for_search")
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+
+    options = uc.ChromeOptions()
+    options.add_argument(f"--user-data-dir={USER_DATA_DIR}")
+    options.add_argument("--no-first-run")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--lang=zh-CN")
+
+    driver = uc.Chrome(options=options, use_subprocess=True)
+    player_id = None
+
+    try:
+        driver.get("https://amae-koromo.sapk.ch/")
+
+        # 等待搜索框
+        search_box = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.ID, "mui-3"))
+        )
+        search_box.clear()
+        search_box.send_keys(nickname)
+        print(f"✅ 已输入昵称: {nickname}")
+
+        # 等待并点击第一个下拉选项
+        try:
+            first_option = WebDriverWait(driver, 6).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "ul[role='listbox'] li"))
+            )
+            print("✅ 检测到匹配项，正在点击...")
+            first_option.click()
+
+            # 等待跳转完成
+            WebDriverWait(driver, 10).until(
+                lambda d: "/player/" in d.current_url
+            )
+
+            # 🔑 提取玩家 ID
+            current_url = driver.current_url
+            match = re.search(r'/player/(\d+)', current_url)
+            if match:
+                player_id = match.group(1)
+                print(f"🎯 玩家ID: {player_id}")
+            else:
+                print("❌ 无法从 URL 提取玩家 ID")
+                return None
+
+        except Exception as e:
+            print("❌ 未找到匹配的玩家（下拉列表未出现）")
+            print(f"当前页面: {driver.current_url}")
+            return None
+
+    except Exception as e:
+        print(f"🚨 搜索过程异常: {repr(e)}")
+        return None
+    finally:
+        driver.quit()
+
+    return player_id
+
+
+def extract_latest_mjai_links(player_id, room_code, num_games, headless=False):
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    url = f"https://amae-koromo.sapk.ch/player/{player_id}/{room_code}"
+    print(f"🌐 正在加载: {url}")
+
+    options = Options()
+    options.add_argument("--lang=zh-CN")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-proxy-server")
+    options.add_argument("--proxy-server='direct://'")
+    options.add_argument("--proxy-bypass-list=*")
+    # 🔥 根据 headless 参数决定是否后台运行
+    if headless:
+        options.add_argument("--headless=new")
+    # 🔥 添加页面渲染策略
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-ipc-flooding-protection")
+
+    print("🔧 启动浏览器...")
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+    try:
+        driver.get(url)
+        time.sleep(5)  # 🔥 增加等待时间，确保页面完全加载
+
+        print(f"🔽 开始滚动，寻找前 {num_games} 个对局...")
+        seen_indices = set()
+        link_records = []
+        consecutive_no_new = 0
+        max_no_new = 5
+        total_scrolls = 0
+
+        while consecutive_no_new < max_no_new and len(link_records) < num_games * 2:
+            driver.execute_script(f"window.scrollBy(0, 500);")
+            total_scrolls += 1
+            time.sleep(0.5)  # 🔥 增加等待时间，确保滚动后元素加载
+
+            # 🔥 等待元素出现后再查找
+            try:
+                # 等待至少有一个带 aria-rowindex 的元素出现
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, "//div[@aria-rowindex]"))
+                )
+            except:
+                print("  ⚠️ 未找到任何行元素，继续滚动...")
+                pass
+
+            current_rows = driver.find_elements(By.XPATH, "//div[@aria-rowindex]")
+            new_links = 0
+
+            for row in current_rows:
+                try:
+                    idx_str = row.get_attribute("aria-rowindex")
+                    if not idx_str:
+                        continue
+                    idx = int(idx_str)
+                    if idx not in seen_indices and idx <= num_games:
+                        seen_indices.add(idx)
+                        ai_tags = row.find_elements(By.XPATH, ".//a[contains(@title, 'AI')]")
+                        for tag in ai_tags:
+                            href = tag.get_attribute("href")
+                            if href and "mjai.ekyu.moe" in href:
+                                link_records.append((idx, href))
+                                new_links += 1
+                except Exception:
+                    continue
+
+            if new_links > 0:
+                consecutive_no_new = 0
+            else:
+                consecutive_no_new += 1
+
+            print(f"  第 {total_scrolls} 次 → 新增: {new_links}, 累计: {len(link_records)} (目标: {num_games})")
+
+            if len(link_records) >= num_games:
+                break
+
+        link_records.sort(key=lambda x: x[0])
+        result = link_records[:num_games]
+        print(f"✅ 找到 {len(result)} 个链接")
+        return result
+
+    finally:
+        driver.quit()
+
+
+def get_and_extract_rating_from_killerducky(mjai_url, driver):
+    """
+    从 mjai_url 获取 killerducky 页面并直接提取评分，同时保留 json 链接
+    返回: (json_url, rating, ai_consistency) 或 (None, "ERROR", "ERROR")
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    try:
+        # 访问 mjai 链接
+        driver.get(mjai_url)
+        time.sleep(1)
+
+        # 点击 Submit 按钮
+        submit_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[type="submit"][name="submitBtn"]'))
+        )
+        driver.execute_script("arguments[0].scrollIntoView();", submit_btn)
+        time.sleep(0.5)
+        submit_btn.click()
+
+        # 等待跳转到 killerducky 页面
+        WebDriverWait(driver, 20).until(EC.url_contains("/killerducky/"))
+        killerducky_url = driver.current_url
+        print(f"  ✅ 跳转成功: {killerducky_url}")
+
+        # 🔥 从 URL 提取 JSON 链接（保留中间结果）
+        parsed = urlparse(killerducky_url)
+        data_path = parse_qs(parsed.query).get("data", [None])[0]
+        if not data_path or not data_path.endswith(".json"):
+            print(f"  ❌ 未找到 JSON 路径: {killerducky_url}")
+            json_url = "ERROR"
+        else:
+            json_url = f"https://mjai.ekyu.moe{data_path}"
+            print(f"  📁 JSON 链接: {json_url}")
+
+        # 点击 About 按钮
+        about_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "About")]'))
+        )
+        about_btn.click()
+        print("  🖱️ 已点击 About")
+
+        # 等待弹窗和表格
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.ID, "about-modal"))
+        )
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, '//*[@id="about-modal"]//table'))
+        )
+
+        # 获取所有行
+        trs = driver.find_elements(By.XPATH, '//*[@id="about-modal"]//table/tbody/tr')
+        print(f"  📊 找到 {len(trs)} 行数据")
+
+        # 提取第 [7] 和 [8] 行（索引从0开始，所以是 [7] 和 [8]）
+        ai_consistency = "N/A"
+        rating = "N/A"
+
+        if len(trs) >= 9:
+            # 第 [7] 行（实际索引7）- AI一致率
+            if len(trs) > 7:
+                tds_7 = trs[7].find_elements(By.TAG_NAME, "td")
+                if len(tds_7) >= 2:
+                    ai_consistency = tds_7[1].get_attribute("innerText").strip()
+
+            # 第 [8] 行（实际索引8）- Rating
+            if len(trs) > 8:
+                tds_8 = trs[8].find_elements(By.TAG_NAME, "td")
+                if len(tds_8) >= 2:
+                    rating = tds_8[1].get_attribute("innerText").strip()
+
+        print(f"  ✅ 提取结果: rating={rating}, 一致率={ai_consistency}")
+        return json_url, rating, ai_consistency
+
+    except Exception as e:
+        print(f"  ❌ 处理失败: {e}")
+        return "ERROR", "ERROR", "ERROR"
+
+
+def main():
+    print("🎯 请输入查询参数：")
+
+    nickname = input("玩家昵称: ").strip()
+    if not nickname:
+        print("❌ 昵称不能为空。")
+        return
+
+    room_code = input("房间ID (9=金之间, 12=玉之间): ").strip()
+    num_games = int(input("查找对局数: ").strip())
+
+    # 🔥 询问是否后台运行
+    headless_input = input("是否后台运行？(Y/n): ").strip().lower()
+    HEADLESS = headless_input != 'n' and headless_input != 'N'
+
+    # 🔥 获取玩家ID
+    print("\n🔍 正在获取玩家ID...")
+    player_id = get_player_id_by_nickname(nickname)
+    if not player_id:
+        print("❌ 无法获取玩家ID，程序退出。")
+        return
+
+    print(f"✅ 成功获取玩家ID: {player_id}")
+
+    ROOM_NAMES = {"9": "金", "12": "玉"}
+    room_name = ROOM_NAMES.get(room_code, f"{room_code}房")
+
+    mode_text = "后台" if HEADLESS else "前台"
+    print(f"\n🚀 开始处理玩家 {nickname} ({player_id}) 房间 {room_name}（{room_code}）的前 {num_games} 场对局")
+    print(f"   运行模式: {mode_text}")
+
+    # 阶段1：获取 mjai 链接
+    print("\n1️⃣ 获取 MJAI 链接...")
+    index_mjai_pairs = extract_latest_mjai_links(player_id, room_code, num_games, HEADLESS)
+    if not index_mjai_pairs:
+        print("❌ 未找到任何对局链接")
+        return
+
+    print(f"✅ 获取到 {len(index_mjai_pairs)} 个链接")
+
+    # 阶段2：获取评分（合并提交 + 提取 + 保存 json 链接）
+    print("\n2️⃣ 获取评分数据（此阶段可能较慢，请耐心）...")
+
+    USER_DATA_DIR = os.path.abspath("./chrome_user_data")
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+
+    options = uc.ChromeOptions()
+    options.add_argument(f"--user-data-dir={USER_DATA_DIR}")
+    options.add_argument("--no-first-run")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--lang=zh-CN")
+
+    # 🔥 根据用户选择决定是否后台运行
+    if HEADLESS:
+        options.add_argument("--headless=new")
+
+    driver = uc.Chrome(options=options, use_subprocess=True)
+    results = []
+
+    try:
+        for i, (idx, mjai_url) in enumerate(index_mjai_pairs):
+            print(f"\n  [{i + 1}/{len(index_mjai_pairs)}] 处理 index={idx}")
+
+            json_url, rating, ai_consistency = get_and_extract_rating_from_killerducky(mjai_url, driver)
+
+            results.append({
+                "mjai链接": mjai_url,
+                "json链接": json_url,
+                "rating": rating,
+                "ai一致率": ai_consistency
+            })
+
+            print(f"    → rating: {rating}, 一致率: {ai_consistency}")
+            time.sleep(2)
+
+    finally:
+        driver.quit()
+
+    # 输出 CSV（使用昵称命名）
+    output_file = f"{nickname}_{room_name}_近{num_games}场.csv"
+    with open(output_file, "w", encoding="utf-8-sig", newline="") as f:
+        fieldnames = ["mjai链接", "json链接", "rating", "ai一致率"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(f"\n🎉 完成！结果已保存到: {os.path.abspath(output_file)}")
+    print(f"📊 共处理 {len(results)} 个对局")
+
+    # 🔥 简化版：只提取百分比数值
+    valid_ratings = []
+    valid_consistencies = []
+
+    for row in results:
+        rating = row["rating"]
+        consistency = row["ai一致率"]
+
+        # 处理 rating（数字或百分比）
+        if rating != "ERROR" and rating != "N/A":
+            try:
+                if isinstance(rating, str) and rating.endswith("%"):
+                    valid_ratings.append(float(rating.rstrip("%")))
+                else:
+                    valid_ratings.append(float(rating))
+            except:
+                pass
+
+        # 🔥 只提取百分比数值，忽略分式部分
+        if consistency != "ERROR" and consistency != "N/A":
+            try:
+                consistency_str = str(consistency)
+
+                # 如果包含百分号，直接提取数值
+                if "%" in consistency_str:
+                    # 找到最后一个 % 前的数字部分
+                    percent_pos = consistency_str.rfind("%")
+                    # 向前找数字开始的位置
+                    start_pos = percent_pos - 1
+                    while start_pos >= 0 and (
+                            consistency_str[start_pos].isdigit() or consistency_str[start_pos] == "."):
+                        start_pos -= 1
+                    start_pos += 1
+
+                    if start_pos < percent_pos:
+                        percentage_value = consistency_str[start_pos:percent_pos]
+                        valid_consistencies.append(float(percentage_value))
+                else:
+                    # 如果没有百分号，直接尝试转换为数字
+                    valid_consistencies.append(float(consistency_str))
+
+            except:
+                pass
+
+    avg_rating = sum(valid_ratings) / len(valid_ratings) if valid_ratings else 0
+    avg_consistency = sum(valid_consistencies) / len(valid_consistencies) if valid_consistencies else 0
+
+    print(f"\n📈 统计结果:")
+    print(f"  平均Rating: {avg_rating:.2f}")
+    print(f"  平均一致率: {avg_consistency:.2f}%")
+    print(f"  有效对局数: {len(valid_ratings)} / {len(results)}")
+
+    print("\n📋 结果预览:")
+    for i, row in enumerate(results[:3]):
+        print(f"  {i + 1}. rating={row['rating']}, 一致率={row['ai一致率']}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
