@@ -1,4 +1,4 @@
-# integrated_pipeline_fixed.py
+# 查rt工具.py
 import os
 import time
 import json
@@ -19,7 +19,8 @@ def setup_chrome_options(headless=False, user_data_dir=None):
     options = uc.ChromeOptions()
 
     if user_data_dir:
-        options.add_argument(f"--user-data-dir={user_data_dir}")
+        abs_path = os.path.abspath(user_data_dir)
+        options.add_argument(f"--user-data-dir={abs_path}")
         options.add_argument("--no-first-run")
         options.add_argument("--disable-extensions")
 
@@ -168,78 +169,67 @@ def extract_latest_mjai_links(player_id, room_code, num_games, driver):
 
 def get_and_extract_rating_from_killerducky(mjai_url, driver):
     """
-    从 mjai_url 获取 killerducky 页面并直接提取评分，同时保留 json 链接
-    返回: (json_url, rating, ai_consistency) 或 (None, "ERROR", "ERROR")
+    增强版：支持人工过 Cloudflare 后自动继续
     """
     try:
-        # 访问 mjai 链接
+        print(f"  🌐 访问: {mjai_url}")
         driver.get(mjai_url)
         time.sleep(1)
 
-        # 点击 Submit 按钮
         submit_btn = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[type="submit"][name="submitBtn"]'))
         )
         driver.execute_script("arguments[0].scrollIntoView();", submit_btn)
         time.sleep(0.5)
         submit_btn.click()
+        print("  ✅ 已点击 Submit")
 
-        # 等待跳转到 killerducky 页面
-        WebDriverWait(driver, 20).until(EC.url_contains("/killerducky/"))
-        killerducky_url = driver.current_url
-        print(f"  ✅ 跳转成功: {killerducky_url}")
+        print("  ⏳ 等待跳转到 KillerDucky（如遇 Cloudflare，请人工验证）...")
+        start_wait = time.time()
+        killerducky_url = None
 
-        # 🔥 从 URL 提取 JSON 链接（保留中间结果）
+        while time.time() - start_wait < 60:
+            current_url = driver.current_url
+            if "/killerducky/" in current_url:
+                killerducky_url = current_url
+                break
+            elif "challenges.cloudflare.com" in current_url:
+                print("  ⚠️ 检测到 Cloudflare 验证，请人工完成（完成后脚本将自动继续）")
+                time.sleep(3)
+            else:
+                time.sleep(1)
+
+        if not killerducky_url:
+            print("  ❌ 超时：未进入 KillerDucky 页面")
+            return "ERROR", "ERROR", "ERROR"
+
+        print(f"  ✅ 成功进入: {killerducky_url}")
+
+        # 提取 JSON 链接
         parsed = urlparse(killerducky_url)
         data_path = parse_qs(parsed.query).get("data", [None])[0]
-        if not data_path or not data_path.endswith(".json"):
-            print(f"  ❌ 未找到 JSON 路径: {killerducky_url}")
-            json_url = "ERROR"
-        else:
-            json_url = f"https://mjai.ekyu.moe{data_path}"
-            print(f"  📁 JSON 链接: {json_url}")
+        json_url = f"https://mjai.ekyu.moe{data_path}" if data_path and data_path.endswith(".json") else "ERROR"
+        print(f"  📁 JSON 链接: {json_url}")
 
-        # 点击 About 按钮
-        about_btn = WebDriverWait(driver, 10).until(
+        # 点击 About 并提取数据
+        about_btn = WebDriverWait(driver, 15).until(
             EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "About")]'))
         )
         about_btn.click()
-        print("  🖱️ 已点击 About")
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "about-modal")))
 
-        # 等待弹窗和表格
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, "about-modal"))
-        )
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, '//*[@id="about-modal"]//table'))
-        )
-
-        # 获取所有行
         trs = driver.find_elements(By.XPATH, '//*[@id="about-modal"]//table/tbody/tr')
-        print(f"  📊 找到 {len(trs)} 行数据")
-
-        # 提取第 [7] 和 [8] 行（索引从0开始，所以是 [7] 和 [8]）
-        ai_consistency = "N/A"
-        rating = "N/A"
-
+        ai_consistency = rating = "N/A"
         if len(trs) >= 9:
-            # 第 [7] 行（实际索引7）- AI一致率
-            if len(trs) > 7:
-                tds_7 = trs[7].find_elements(By.TAG_NAME, "td")
-                if len(tds_7) >= 2:
-                    ai_consistency = tds_7[1].get_attribute("innerText").strip()
+            if len(trs[7].find_elements(By.TAG_NAME, "td")) >= 2:
+                ai_consistency = trs[7].find_elements(By.TAG_NAME, "td")[1].text.strip()
+            if len(trs[8].find_elements(By.TAG_NAME, "td")) >= 2:
+                rating = trs[8].find_elements(By.TAG_NAME, "td")[1].text.strip()
 
-            # 第 [8] 行（实际索引8）- Rating
-            if len(trs) > 8:
-                tds_8 = trs[8].find_elements(By.TAG_NAME, "td")
-                if len(tds_8) >= 2:
-                    rating = tds_8[1].get_attribute("innerText").strip()
-
-        print(f"  ✅ 提取结果: rating={rating}, 一致率={ai_consistency}")
         return json_url, rating, ai_consistency
 
     except Exception as e:
-        print(f"  ❌ 处理失败: {e}")
+        print(f"  ❌ 异常: {repr(e)}")
         return "ERROR", "ERROR", "ERROR"
 
 
@@ -258,9 +248,14 @@ def main():
     headless_input = input("是否后台运行？(Y/n): ").strip().lower()
     HEADLESS = headless_input != 'n' and headless_input != 'N'
 
-    # 🔥 创建单一浏览器实例
+    # 🔥 创建持久化用户数据目录（保留 Cloudflare 验证状态）
+    import tempfile
+    user_data_dir = os.path.join(tempfile.gettempdir(), f"mjai_uc_{nickname}_{int(time.time())}")
+
+    print(f"\n📁 用户数据目录: {user_data_dir}")
     print("\n🔧 启动浏览器...")
-    options = setup_chrome_options(headless=HEADLESS)
+
+    options = setup_chrome_options(headless=HEADLESS, user_data_dir=user_data_dir)
     driver = uc.Chrome(options=options, use_subprocess=True)
 
     try:
@@ -383,3 +378,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
