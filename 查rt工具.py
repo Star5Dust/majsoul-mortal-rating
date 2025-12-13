@@ -1,4 +1,4 @@
-# integrated_pipeline.py
+# integrated_pipeline_fixed.py
 import os
 import time
 import json
@@ -12,27 +12,41 @@ from selenium.webdriver.support import expected_conditions as EC
 import re
 
 
-
-
-
-def get_player_id_by_nickname(nickname):
+def setup_chrome_options(headless=False, user_data_dir=None):
     """
-    通过昵称获取玩家ID
+    统一的 Chrome 选项配置
+    """
+    options = uc.ChromeOptions()
+
+    if user_data_dir:
+        options.add_argument(f"--user-data-dir={user_data_dir}")
+        options.add_argument("--no-first-run")
+        options.add_argument("--disable-extensions")
+
+    options.add_argument("--lang=zh-CN")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-proxy-server")
+    options.add_argument("--proxy-server='direct://'")
+    options.add_argument("--proxy-bypass-list=*")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-ipc-flooding-protection")
+
+    if headless:
+        options.add_argument("--headless=new")
+
+    return options
+
+
+def get_player_id_by_nickname(nickname, driver):
+    """
+    通过昵称获取玩家ID（复用现有浏览器）
     返回: player_id 或 None
     """
     print(f"🔍 正在搜索玩家: {nickname}")
-
-    USER_DATA_DIR = os.path.abspath("./chrome_user_data_for_search")
-    os.makedirs(USER_DATA_DIR, exist_ok=True)
-
-    options = uc.ChromeOptions()
-    options.add_argument(f"--user-data-dir={USER_DATA_DIR}")
-    options.add_argument("--no-first-run")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--lang=zh-CN")
-
-    driver = uc.Chrome(options=options, use_subprocess=True)
-    player_id = None
 
     try:
         driver.get("https://amae-koromo.sapk.ch/")
@@ -64,6 +78,7 @@ def get_player_id_by_nickname(nickname):
             if match:
                 player_id = match.group(1)
                 print(f"🎯 玩家ID: {player_id}")
+                return player_id
             else:
                 print("❌ 无法从 URL 提取玩家 ID")
                 return None
@@ -76,49 +91,18 @@ def get_player_id_by_nickname(nickname):
     except Exception as e:
         print(f"🚨 搜索过程异常: {repr(e)}")
         return None
-    finally:
-        driver.quit()
-
-    return player_id
 
 
-def extract_latest_mjai_links(player_id, room_code, num_games, headless=False):
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-
+def extract_latest_mjai_links(player_id, room_code, num_games, driver):
+    """
+    提取 MJAI 链接（复用现有浏览器）
+    """
     url = f"https://amae-koromo.sapk.ch/player/{player_id}/{room_code}"
     print(f"🌐 正在加载: {url}")
 
-    options = Options()
-    options.add_argument("--lang=zh-CN")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-proxy-server")
-    options.add_argument("--proxy-server='direct://'")
-    options.add_argument("--proxy-bypass-list=*")
-    # 🔥 根据 headless 参数决定是否后台运行
-    if headless:
-        options.add_argument("--headless=new")
-    # 🔥 添加页面渲染策略
-    options.add_argument("--disable-background-timer-throttling")
-    options.add_argument("--disable-renderer-backgrounding")
-    options.add_argument("--disable-backgrounding-occluded-windows")
-    options.add_argument("--disable-ipc-flooding-protection")
-
-    print("🔧 启动浏览器...")
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
     try:
         driver.get(url)
-        time.sleep(5)  # 🔥 增加等待时间，确保页面完全加载
+        time.sleep(5)  # 🔥 确保页面完全加载
 
         print(f"🔽 开始滚动，寻找前 {num_games} 个对局...")
         seen_indices = set()
@@ -130,7 +114,7 @@ def extract_latest_mjai_links(player_id, room_code, num_games, headless=False):
         while consecutive_no_new < max_no_new and len(link_records) < num_games * 2:
             driver.execute_script(f"window.scrollBy(0, 500);")
             total_scrolls += 1
-            time.sleep(0.5)  # 🔥 增加等待时间，确保滚动后元素加载
+            time.sleep(0.5)  # 🔥 确保滚动后元素加载
 
             # 🔥 等待元素出现后再查找
             try:
@@ -177,8 +161,9 @@ def extract_latest_mjai_links(player_id, room_code, num_games, headless=False):
         print(f"✅ 找到 {len(result)} 个链接")
         return result
 
-    finally:
-        driver.quit()
+    except Exception as e:
+        print(f"❌ 提取链接失败: {e}")
+        return []
 
 
 def get_and_extract_rating_from_killerducky(mjai_url, driver):
@@ -186,10 +171,6 @@ def get_and_extract_rating_from_killerducky(mjai_url, driver):
     从 mjai_url 获取 killerducky 页面并直接提取评分，同时保留 json 链接
     返回: (json_url, rating, ai_consistency) 或 (None, "ERROR", "ERROR")
     """
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-
     try:
         # 访问 mjai 链接
         driver.get(mjai_url)
@@ -277,51 +258,41 @@ def main():
     headless_input = input("是否后台运行？(Y/n): ").strip().lower()
     HEADLESS = headless_input != 'n' and headless_input != 'N'
 
-    # 🔥 获取玩家ID
-    print("\n🔍 正在获取玩家ID...")
-    player_id = get_player_id_by_nickname(nickname)
-    if not player_id:
-        print("❌ 无法获取玩家ID，程序退出。")
-        return
-
-    print(f"✅ 成功获取玩家ID: {player_id}")
-
-    ROOM_NAMES = {"9": "金", "12": "玉"}
-    room_name = ROOM_NAMES.get(room_code, f"{room_code}房")
-
-    mode_text = "后台" if HEADLESS else "前台"
-    print(f"\n🚀 开始处理玩家 {nickname} ({player_id}) 房间 {room_name}（{room_code}）的前 {num_games} 场对局")
-    print(f"   运行模式: {mode_text}")
-
-    # 阶段1：获取 mjai 链接
-    print("\n1️⃣ 获取 MJAI 链接...")
-    index_mjai_pairs = extract_latest_mjai_links(player_id, room_code, num_games, HEADLESS)
-    if not index_mjai_pairs:
-        print("❌ 未找到任何对局链接")
-        return
-
-    print(f"✅ 获取到 {len(index_mjai_pairs)} 个链接")
-
-    # 阶段2：获取评分（合并提交 + 提取 + 保存 json 链接）
-    print("\n2️⃣ 获取评分数据（此阶段可能较慢，请耐心）...")
-
-    USER_DATA_DIR = os.path.abspath("./chrome_user_data")
-    os.makedirs(USER_DATA_DIR, exist_ok=True)
-
-    options = uc.ChromeOptions()
-    options.add_argument(f"--user-data-dir={USER_DATA_DIR}")
-    options.add_argument("--no-first-run")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--lang=zh-CN")
-
-    # 🔥 根据用户选择决定是否后台运行
-    if HEADLESS:
-        options.add_argument("--headless=new")
-
+    # 🔥 创建单一浏览器实例
+    print("\n🔧 启动浏览器...")
+    options = setup_chrome_options(headless=HEADLESS)
     driver = uc.Chrome(options=options, use_subprocess=True)
-    results = []
 
     try:
+        # 🔥 获取玩家ID（复用浏览器）
+        print("\n🔍 正在获取玩家ID...")
+        player_id = get_player_id_by_nickname(nickname, driver)
+        if not player_id:
+            print("❌ 无法获取玩家ID，程序退出。")
+            return
+
+        print(f"✅ 成功获取玩家ID: {player_id}")
+
+        ROOM_NAMES = {"9": "金", "12": "玉"}
+        room_name = ROOM_NAMES.get(room_code, f"{room_code}房")
+
+        mode_text = "后台" if HEADLESS else "前台"
+        print(f"\n🚀 开始处理玩家 {nickname} ({player_id}) 房间 {room_name}（{room_code}）的前 {num_games} 场对局")
+        print(f"   运行模式: {mode_text}")
+
+        # 阶段1：获取 mjai 链接（复用浏览器）
+        print("\n1️⃣ 获取 MJAI 链接...")
+        index_mjai_pairs = extract_latest_mjai_links(player_id, room_code, num_games, driver)
+        if not index_mjai_pairs:
+            print("❌ 未找到任何对局链接")
+            return
+
+        print(f"✅ 获取到 {len(index_mjai_pairs)} 个链接")
+
+        # 阶段2：获取评分（复用同一个浏览器！）
+        print("\n2️⃣ 获取评分数据（此阶段可能较慢，请耐心）...")
+        results = []
+
         for i, (idx, mjai_url) in enumerate(index_mjai_pairs):
             print(f"\n  [{i + 1}/{len(index_mjai_pairs)}] 处理 index={idx}")
 
@@ -337,81 +308,78 @@ def main():
             print(f"    → rating: {rating}, 一致率: {ai_consistency}")
             time.sleep(2)
 
+        # 输出 CSV（使用昵称命名）
+        output_file = f"{nickname}_{room_name}_近{num_games}场.csv"
+        with open(output_file, "w", encoding="utf-8-sig", newline="") as f:
+            fieldnames = ["mjai链接", "json链接", "rating", "ai一致率"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(results)
+
+        print(f"\n🎉 完成！结果已保存到: {os.path.abspath(output_file)}")
+        print(f"📊 共处理 {len(results)} 个对局")
+
+        # 🔥 简化版：只提取百分比数值
+        valid_ratings = []
+        valid_consistencies = []
+
+        for row in results:
+            rating = row["rating"]
+            consistency = row["ai一致率"]
+
+            # 处理 rating（数字或百分比）
+            if rating != "ERROR" and rating != "N/A":
+                try:
+                    if isinstance(rating, str) and rating.endswith("%"):
+                        valid_ratings.append(float(rating.rstrip("%")))
+                    else:
+                        valid_ratings.append(float(rating))
+                except:
+                    pass
+
+            # 🔥 只提取百分比数值，忽略分式部分
+            if consistency != "ERROR" and consistency != "N/A":
+                try:
+                    consistency_str = str(consistency)
+
+                    # 如果包含百分号，直接提取数值
+                    if "%" in consistency_str:
+                        # 找到最后一个 % 前的数字部分
+                        percent_pos = consistency_str.rfind("%")
+                        # 向前找数字开始的位置
+                        start_pos = percent_pos - 1
+                        while start_pos >= 0 and (
+                                consistency_str[start_pos].isdigit() or consistency_str[start_pos] == "."):
+                            start_pos -= 1
+                        start_pos += 1
+
+                        if start_pos < percent_pos:
+                            percentage_value = consistency_str[start_pos:percent_pos]
+                            valid_consistencies.append(float(percentage_value))
+                    else:
+                        # 如果没有百分号，直接尝试转换为数字
+                        valid_consistencies.append(float(consistency_str))
+
+                except:
+                    pass
+
+        avg_rating = sum(valid_ratings) / len(valid_ratings) if valid_ratings else 0
+        avg_consistency = sum(valid_consistencies) / len(valid_consistencies) if valid_consistencies else 0
+
+        print(f"\n📈 统计结果:")
+        print(f"  平均Rating: {avg_rating:.2f}")
+        print(f"  平均一致率: {avg_consistency:.2f}%")
+        print(f"  有效对局数: {len(valid_ratings)} / {len(results)}")
+
+        print("\n📋 结果预览:")
+        for i, row in enumerate(results[:3]):
+            print(f"  {i + 1}. rating={row['rating']}, 一致率={row['ai一致率']}")
+
     finally:
+        # 🔥 统一关闭浏览器
         driver.quit()
-
-    # 输出 CSV（使用昵称命名）
-    output_file = f"{nickname}_{room_name}_近{num_games}场.csv"
-    with open(output_file, "w", encoding="utf-8-sig", newline="") as f:
-        fieldnames = ["mjai链接", "json链接", "rating", "ai一致率"]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(results)
-
-    print(f"\n🎉 完成！结果已保存到: {os.path.abspath(output_file)}")
-    print(f"📊 共处理 {len(results)} 个对局")
-
-    # 🔥 简化版：只提取百分比数值
-    valid_ratings = []
-    valid_consistencies = []
-
-    for row in results:
-        rating = row["rating"]
-        consistency = row["ai一致率"]
-
-        # 处理 rating（数字或百分比）
-        if rating != "ERROR" and rating != "N/A":
-            try:
-                if isinstance(rating, str) and rating.endswith("%"):
-                    valid_ratings.append(float(rating.rstrip("%")))
-                else:
-                    valid_ratings.append(float(rating))
-            except:
-                pass
-
-        # 🔥 只提取百分比数值，忽略分式部分
-        if consistency != "ERROR" and consistency != "N/A":
-            try:
-                consistency_str = str(consistency)
-
-                # 如果包含百分号，直接提取数值
-                if "%" in consistency_str:
-                    # 找到最后一个 % 前的数字部分
-                    percent_pos = consistency_str.rfind("%")
-                    # 向前找数字开始的位置
-                    start_pos = percent_pos - 1
-                    while start_pos >= 0 and (
-                            consistency_str[start_pos].isdigit() or consistency_str[start_pos] == "."):
-                        start_pos -= 1
-                    start_pos += 1
-
-                    if start_pos < percent_pos:
-                        percentage_value = consistency_str[start_pos:percent_pos]
-                        valid_consistencies.append(float(percentage_value))
-                else:
-                    # 如果没有百分号，直接尝试转换为数字
-                    valid_consistencies.append(float(consistency_str))
-
-            except:
-                pass
-
-    avg_rating = sum(valid_ratings) / len(valid_ratings) if valid_ratings else 0
-    avg_consistency = sum(valid_consistencies) / len(valid_consistencies) if valid_consistencies else 0
-
-    print(f"\n📈 统计结果:")
-    print(f"  平均Rating: {avg_rating:.2f}")
-    print(f"  平均一致率: {avg_consistency:.2f}%")
-    print(f"  有效对局数: {len(valid_ratings)} / {len(results)}")
-
-    print("\n📋 结果预览:")
-    for i, row in enumerate(results[:3]):
-        print(f"  {i + 1}. rating={row['rating']}, 一致率={row['ai一致率']}")
+        print("\n👋 浏览器已关闭")
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
