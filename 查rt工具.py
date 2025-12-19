@@ -1,4 +1,4 @@
-# 查rt工具.py
+# 查3.0_优化版.py
 import os
 import time
 import json
@@ -10,6 +10,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import re
+import tempfile
 
 
 def setup_chrome_options(headless=False, user_data_dir=None):
@@ -36,6 +37,11 @@ def setup_chrome_options(headless=False, user_data_dir=None):
     options.add_argument("--disable-backgrounding-occluded-windows")
     options.add_argument("--disable-ipc-flooding-protection")
 
+    # 添加额外的反检测参数
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    #options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    #options.add_experimental_option('useAutomationExtension', False)
+
     if headless:
         options.add_argument("--headless=new")
 
@@ -52,6 +58,9 @@ def get_player_id_by_nickname(nickname, driver):
     try:
         driver.get("https://amae-koromo.sapk.ch/")
 
+        # 设置页面加载超时
+        driver.set_page_load_timeout(30)
+
         # 等待搜索框
         search_box = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.ID, "mui-3"))
@@ -62,14 +71,14 @@ def get_player_id_by_nickname(nickname, driver):
 
         # 等待并点击第一个下拉选项
         try:
-            first_option = WebDriverWait(driver, 6).until(
+            first_option = WebDriverWait(driver, 10).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "ul[role='listbox'] li"))
             )
             print("✅ 检测到匹配项，正在点击...")
             first_option.click()
 
             # 等待跳转完成
-            WebDriverWait(driver, 10).until(
+            WebDriverWait(driver, 15).until(
                 lambda d: "/player/" in d.current_url
             )
 
@@ -174,17 +183,32 @@ def get_and_extract_rating_from_killerducky(mjai_url, driver):
     try:
         print(f"  🌐 访问: {mjai_url}")
         driver.get(mjai_url)
-        time.sleep(1)
+        time.sleep(2)  # 增加等待时间
 
-        submit_btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[type="submit"][name="submitBtn"]'))
-        )
-        driver.execute_script("arguments[0].scrollIntoView();", submit_btn)
-        time.sleep(0.5)
-        submit_btn.click()
-        print("  ✅ 已点击 Submit")
+        # 尝试找到并点击Submit按钮
+        try:
+            submit_btn = WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[type="submit"][name="submitBtn"]'))
+            )
+            driver.execute_script("arguments[0].scrollIntoView();", submit_btn)
+            time.sleep(1)
+            submit_btn.click()
+            print("  ✅ 已点击 Submit")
+        except:
+            print("  ⚠️ 未找到Submit按钮，可能是Cloudflare验证页面")
+            # 等待用户手动完成验证
+            print("  ⚠️ 如遇到Cloudflare验证，请手动完成，完成后脚本将继续执行...")
+            wait_time = 0
+            max_wait = 120  # 最多等待2分钟
+            while wait_time < max_wait:
+                current_url = driver.current_url
+                if "challenges.cloudflare.com" not in current_url and "/killerducky/" in current_url:
+                    print("  ✅ 检测到已通过验证，继续处理...")
+                    break
+                time.sleep(5)
+                wait_time += 5
 
-        print("  ⏳ 等待跳转到 KillerDucky（如遇 Cloudflare，请人工验证）...")
+        print("  ⏳ 等待跳转到 KillerDucky...")
         start_wait = time.time()
         killerducky_url = None
 
@@ -195,9 +219,9 @@ def get_and_extract_rating_from_killerducky(mjai_url, driver):
                 break
             elif "challenges.cloudflare.com" in current_url:
                 print("  ⚠️ 检测到 Cloudflare 验证，请人工完成（完成后脚本将自动继续）")
-                time.sleep(3)
+                time.sleep(5)
             else:
-                time.sleep(1)
+                time.sleep(2)
 
         if not killerducky_url:
             print("  ❌ 超时：未进入 KillerDucky 页面")
@@ -211,22 +235,29 @@ def get_and_extract_rating_from_killerducky(mjai_url, driver):
         json_url = f"https://mjai.ekyu.moe{data_path}" if data_path and data_path.endswith(".json") else "ERROR"
         print(f"  📁 JSON 链接: {json_url}")
 
+        # 等待页面加载完成
+        time.sleep(3)
+
         # 点击 About 并提取数据
-        about_btn = WebDriverWait(driver, 15).until(
-            EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "About")]'))
-        )
-        about_btn.click()
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "about-modal")))
+        try:
+            about_btn = WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "About")]'))
+            )
+            about_btn.click()
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "about-modal")))
 
-        trs = driver.find_elements(By.XPATH, '//*[@id="about-modal"]//table/tbody/tr')
-        ai_consistency = rating = "N/A"
-        if len(trs) >= 9:
-            if len(trs[7].find_elements(By.TAG_NAME, "td")) >= 2:
-                ai_consistency = trs[7].find_elements(By.TAG_NAME, "td")[1].text.strip()
-            if len(trs[8].find_elements(By.TAG_NAME, "td")) >= 2:
-                rating = trs[8].find_elements(By.TAG_NAME, "td")[1].text.strip()
+            trs = driver.find_elements(By.XPATH, '//*[@id="about-modal"]//table/tbody/tr')
+            ai_consistency = rating = "N/A"
+            if len(trs) >= 9:
+                if len(trs[7].find_elements(By.TAG_NAME, "td")) >= 2:
+                    ai_consistency = trs[7].find_elements(By.TAG_NAME, "td")[1].text.strip()
+                if len(trs[8].find_elements(By.TAG_NAME, "td")) >= 2:
+                    rating = trs[8].find_elements(By.TAG_NAME, "td")[1].text.strip()
 
-        return json_url, rating, ai_consistency
+            return json_url, rating, ai_consistency
+        except Exception as e:
+            print(f"  ❌ 提取数据时出错: {repr(e)}")
+            return json_url, "ERROR", "ERROR"
 
     except Exception as e:
         print(f"  ❌ 异常: {repr(e)}")
@@ -249,7 +280,6 @@ def main():
     HEADLESS = headless_input != 'n' and headless_input != 'N'
 
     # 🔥 创建持久化用户数据目录（保留 Cloudflare 验证状态）
-    import tempfile
     user_data_dir = os.path.join(tempfile.gettempdir(), f"mjai_uc_{nickname}_{int(time.time())}")
 
     print(f"\n📁 用户数据目录: {user_data_dir}")
@@ -257,6 +287,9 @@ def main():
 
     options = setup_chrome_options(headless=HEADLESS, user_data_dir=user_data_dir)
     driver = uc.Chrome(options=options, use_subprocess=True)
+
+    # 隐藏webdriver特征
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
     try:
         # 🔥 获取玩家ID（复用浏览器）
@@ -301,7 +334,10 @@ def main():
             })
 
             print(f"    → rating: {rating}, 一致率: {ai_consistency}")
-            time.sleep(2)
+
+            # 在处理完一个链接后稍微休息，模拟人类行为
+            if i < len(index_mjai_pairs) - 1:  # 不是最后一个
+                time.sleep(3 + i % 3)  # 随机延迟
 
         # 输出 CSV（使用昵称命名）
         output_file = f"{nickname}_{room_name}_近{num_games}场.csv"
