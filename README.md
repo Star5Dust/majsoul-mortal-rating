@@ -1,113 +1,131 @@
 # majsoul-mortal-rating
-雀魂对局评分批量提取工具（查 RT 工具）
 
-> 自动从雀魂牌谱屋（https://amae-koromo.sapk.ch） 提取指定玩家在 金之间 / 玉之间 的对局链接，提交至 mortal(https://mjai.ekyu.moe) 获取 Rating 评分 与 AI 一致率，最终输出为 CSV 文件。
+雀魂对局评分批量提取工具。脚本会从雀魂牌谱屋提取指定玩家在金之间 / 玉之间的最近对局链接，提交到 mortal 页面分析，并把 Rating 与 AI 一致率导出为 CSV。
 
+数据来源：
 
-✅ 功能概览
+- 雀魂牌谱屋：https://amae-koromo.sapk.ch
+- mortal / KillerDucky：https://mjai.ekyu.moe
 
-1. 自动搜索昵称 → 获取玩家 ID
-2. 爬取指定房间（9=金 / 12=玉）中最近 N 场对局链接
-3. 自动提交每场对局到mortal复盘工具页面
-4. 从弹窗中提取：Rating 分数 + AI 一致率（百分比）
-5. 保存完整结果（含 mjai 链接、json 链接、评分）到 CSV
-6. 终端输出平均 Rating 与平均一致率统计
+## 功能
 
+- 按昵称搜索玩家 ID，也支持直接传入 `--player-id`
+- 提取金之间 `9` / 玉之间 `12` 最近 N 场带 AI 链接的对局
+- 自动提交到 mortal 分析页面
+- 从 About 弹窗读取 `rating` 与 `ai_consistency`
+- 每完成一局写入一次 CSV，失败后可重跑续查
+- 终端输出平均 Rating 与平均 AI 一致率
 
-⚠️ 重要限制（必读！）
+## 版本选择
 
-- 必须使用前台模式运行（显示浏览器窗口）
-  第二阶段（提交到mortal）依赖真实用户交互。若启用后台（headless），点击按钮、弹窗加载会失败，导致无法提取评分。
-  
-- 运行时请勿最小化或频繁切换窗口
-  Selenium 在后台或失焦状态下可能无法正确触发事件。
+| 脚本 | 适合场景 |
+| --- | --- |
+| `查rt工具_v2.py` | 稳定优先，单 Chrome 顺序处理 |
+| `查rt工具_v3.py` | 加速版，多 Chrome 并行处理，默认 2 workers |
 
+建议先用 v2 确认环境可用；批量查询再用 v3。v3 不建议开太多并发，同一 IP 高频访问可能触发 Cloudflare 或 rate limit。
 
-🛠 使用前提
+## 安装
 
-- 操作系统：Windows / macOS / Linux
-- Python 版本：≥ 3.8（推荐 3.9+）
-- 已安装 Google Chrome 浏览器（脚本不包含浏览器，仅自动下载驱动）
-- 网络可访问：
-  - https://amae-koromo.sapk.ch
-  - https://mjai.ekyu.moe
+需要 Python 3.8+ 与 Google Chrome。
 
-
-🔧 安装依赖
-
-建议在虚拟环境中操作：
-
+```bash
 pip install selenium undetected-chromedriver webdriver-manager requests
+```
 
-如遇 undetected-chromedriver 安装失败，请先升级构建工具：
+如果安装 `undetected-chromedriver` 失败：
 
+```bash
 pip install --upgrade pip setuptools
+```
 
+## 使用
 
-▶️ 运行方式
+前台 Chrome 更稳定，遇到 Cloudflare 验证时请在打开的浏览器窗口中手动完成。
 
-将脚本保存为 查rt工具.py，在终端执行：
+### v2 稳定版
 
-python 查rt工具.py
+```bash
+python 查rt工具_v2.py --nickname "玩家昵称" --room 12 --games 10
+```
 
-按提示依次输入：
+已知玩家 ID 时可跳过昵称搜索：
 
-1. 玩家昵称（如 七段AI）→ 脚本会自动搜索并提取 ID（无需手动查 ID！）
-2. 房间ID：
-   - 9 → 金之间
-   - 12 → 玉之间
-3. 要分析的对局数量（如 5 或 10）
-4. 是否后台运行？→ 必须输入 n 或直接回车（选择前台）！
+```bash
+python 查rt工具_v2.py --nickname "玩家昵称" --player-id 123456789 --room 12 --games 10
+```
 
-💡 脚本会自动打开 Chrome 窗口，请保持可见直至完成。
+### v3 并行版
 
+```bash
+python 查rt工具_v3.py --nickname "玩家昵称" --room 12 --games 20 --workers 2
+```
 
-📁 输出说明
+如果 2 开稳定，可以谨慎尝试 3 开并增加冷却：
 
-- 文件名格式：{昵称}_{房间名}_近{N}场.csv  
-  示例：时崎狂三V_玉_10场.csv
-- 保存位置：脚本所在目录
-- 编码：UTF-8 with BOM（兼容 Excel/WPS 直接打开不乱码）
+```bash
+python 查rt工具_v3.py --nickname "玩家昵称" --room 12 --games 20 --workers 3 --start-stagger 20 --pre-delay-min 8 --pre-delay-max 25 --post-delay-min 15 --post-delay-max 40
+```
 
-字段含义：
+不建议长期使用 `--workers 4` 以上；如果出现 rate limit，降低 workers 或等待一段时间再跑。
 
-| 字段        | 说明                                      |
-|-------------|-------------------------------------------|
-| mjai链接    | 雀魂牌谱屋中的原始对局页面              |
-| json链接    | 对应牌谱的 JSON 地址（可用于回放）        |
-| rating      | mortal 给出的评分（数字）|
-| ai一致率    | 玩家与 AI 行为的一致率（如 76.2%）        |
+## 参数
 
-终端还会显示：
-- 平均 Rating
-- 平均 AI 一致率（仅提取 % 前的数值）
-- 有效对局数量 / 总处理数量
+| 参数 | 说明 |
+| --- | --- |
+| `--nickname` | 玩家昵称 |
+| `--player-id` | 玩家 ID，传入后跳过昵称搜索 |
+| `--room` | 房间：`9` 金之间，`12` 玉之间 |
+| `--games` | 查询最近 N 场 |
+| `--headless` | 后台模式，不推荐 |
+| `--reset-profile` | 删除对应版本的 Chrome profile 后重跑 |
+| `--workers` | v3 并行 Chrome 数量，默认 2 |
+| `--start-stagger` | v3 worker 启动错峰秒数 |
+| `--pre-delay-min/max` | v3 每局开始前随机等待 |
+| `--post-delay-min/max` | v3 每局结束后随机等待 |
 
+## 输出
 
-❓ 常见问题
+v2 输出到 `outputs_v2/`，v3 输出到 `outputs_v3/`。
 
-Q：提示“未找到任何 AI 对局链接”？
-A：该玩家近期在指定房间没有带 AI 标签的对局。可尝试换房间或查其他玩家。
+CSV 文件名格式：
 
-Q：KillerDucky 页面卡住 / 没跳转 / 弹窗没出现？
-A：可能是网络波动或反爬机制触发。
-解决方法：
-1. 关闭所有 Chrome 窗口
-2. 删除项目目录下的 ./chrome_user_data 和 ./chrome_user_data_for_search 文件夹
-3. 重新运行脚本
+```text
+{昵称}_{房间}_recent_{N}_v2.csv
+{昵称}_{房间}_recent_{N}_v3.csv
+```
 
-Q：Excel 打开 CSV 乱码？
-A：这是编码问题。推荐以下任一方式：
-- 用 WPS 直接打开（自动识别 UTF-8-BOM）
-- 在 Excel 中：数据 → 从文本/CSV 导入 → 编码选 65001: Unicode (UTF-8)
+字段：
 
+| 字段 | 说明 |
+| --- | --- |
+| `index` | 最近对局序号 |
+| `mjai_url` | mortal 对局页面链接 |
+| `json_url` | 对局 JSON 链接 |
+| `rating` | mortal Rating |
+| `ai_consistency` | AI 一致率 |
+| `status` | `OK` / `PARTIAL` / `ERROR` |
 
-🙏 致谢
+CSV 使用 UTF-8 BOM 编码，通常可直接用 Excel / WPS 打开。
 
-- 数据来源：https://amae-koromo.sapk.ch
-- mortal：https://mjai.ekyu.moe
+## 常见问题
 
-> 本工具仅用于个人学习与研究，请遵守网站使用条款，切勿高频请求或用于商业用途。
+**触发 Cloudflare 验证**
 
+在打开的 Chrome 窗口中手动完成验证，脚本会自动继续。验证状态会保存在对应的 `chrome_user_data_v2` 或 `chrome_user_data_v3` 目录。
 
-🀄 祝你顺利提取数据！如有问题，欢迎附上截图与错误日志进一步排查。
+**v3 出现 rate limit**
+
+降低 `--workers`，推荐先用 2。若 3 开也不稳定，增加 `--start-stagger` 和每局前后 delay，或等待一段时间后重跑。
+
+**没有找到 AI 对局链接**
+
+该玩家最近在对应房间可能没有带 AI 标签的对局，换房间、增加场数或换玩家再试。
+
+**结果中有 ERROR / PARTIAL**
+
+可能是页面加载慢、网络波动、Cloudflare、rate limit 或 About 数据尚未生成。脚本会保存已完成结果，可直接重跑补齐。
+
+## 说明
+
+本工具仅用于个人学习与研究。请控制查询频率，遵守目标网站的使用条款。
