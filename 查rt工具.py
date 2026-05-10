@@ -1,25 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-Conservative v2 for the RT/rating lookup tool.
+Parallel v3 for the RT/rating lookup tool.
 
-Compared with the known-working version:
-- keeps one Chrome instance for the whole run
-- uses a persistent Chrome profile so manual Cloudflare verification can be reused
+Compared with v2:
+- keeps the conservative Cloudflare/manual-verification behavior
+- fetches recent MJAI links with one Chrome instance
+- processes games with a small pool of independent Chrome instances
+- gives every worker its own persistent Chrome profile
 - defaults to visible Chrome; headless is optional and not recommended
-- waits for manual Cloudflare verification instead of trying to bypass it
 - writes a CSV checkpoint after every game, so reruns can skip completed rows
-- supports --player-id to skip nickname search
 """
 
 import argparse
 import csv
+import itertools
 import os
 import random
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -31,7 +34,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 
 BASE_DIR = Path(__file__).resolve().parent
-PROFILE_DIR = BASE_DIR / "chrome_user_data_v2"
+PROFILE_ROOT = BASE_DIR / "chrome_user_data_v3"
+LINK_PROFILE_DIR = PROFILE_ROOT / "link_fetch"
 OUTPUT_DIR = BASE_DIR / "outputs_all"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -39,6 +43,20 @@ ROOM_NAMES = {"9": "gold", "12": "jade"}
 CSV_FIELDS = ["index", "mjai_url", "json_url", "rating", "ai_consistency", "status"]
 KILLERDUCKY_SETTLE_SECONDS = 8
 ABOUT_VALUES_MAX_WAIT = 150
+DEFAULT_WORKERS = 3
+MAX_RECOMMENDED_WORKERS = 4
+DEFAULT_START_STAGGER = 10
+DEFAULT_PRE_DELAY_MIN = 3
+DEFAULT_PRE_DELAY_MAX = 12
+DEFAULT_POST_DELAY_MIN = 8
+DEFAULT_POST_DELAY_MAX = 22
+DEFAULT_RATE_LIMIT_BACKOFF = 180
+
+_thread_state = threading.local()
+_worker_counter = itertools.count(1)
+_worker_counter_lock = threading.Lock()
+_driver_registry = []
+_driver_registry_lock = threading.Lock()
 
 
 def human_sleep(a=0.6, b=1.4):
@@ -92,11 +110,12 @@ def get_chrome_major_version():
     return None
 
 
-def build_driver(headless=False):
-    PROFILE_DIR.mkdir(exist_ok=True)
+def build_driver(headless=False, profile_dir=None):
+    profile_dir = Path(profile_dir or LINK_PROFILE_DIR)
+    profile_dir.mkdir(parents=True, exist_ok=True)
 
     options = uc.ChromeOptions()
-    options.add_argument(f"--user-data-dir={PROFILE_DIR}")
+    options.add_argument(f"--user-data-dir={profile_dir}")
     options.add_argument("--profile-directory=Default")
     options.add_argument("--lang=zh-CN")
     options.add_argument("--no-first-run")
@@ -155,6 +174,25 @@ def looks_like_cloudflare(driver):
         or "cf-challenge" in html
         or "cloudflare" in title
     )
+
+
+def looks_like_rate_limited(driver):
+    try:
+        title = (driver.title or "").lower()
+        html = (driver.page_source or "")[:8000].lower()
+    except Exception:
+        return False
+
+    markers = [
+        "rate limit",
+        "rate-limit",
+        "rate limited",
+        "too many requests",
+        "http 429",
+        "error 429",
+        "429 too many",
+    ]
+    return any(marker in title or marker in html for marker in markers)
 
 
 def wait_if_cloudflare(driver, max_wait=240):
@@ -574,35 +612,207 @@ def summarize(rows):
         print(f"  average AI consistency: {sum(consistencies) / len(consistencies):.2f}%")
 
 
+def next_worker_id():
+    with _worker_counter_lock:
+        return next(_worker_counter)
+
+
+def init_worker(headless, start_stagger):
+    worker_id = next_worker_id()
+    profile_dir = PROFILE_ROOT / f"worker_{worker_id}"
+    print(f"[worker {worker_id}] Starting Chrome with profile: {profile_dir}")
+    time.sleep((worker_id - 1) * start_stagger)
+    driver = build_driver(headless=headless, profile_dir=profile_dir)
+    _thread_state.worker_id = worker_id
+    _thread_state.driver = driver
+
+    with _driver_registry_lock:
+        _driver_registry.append(driver)
+
+
+def close_worker_drivers():
+    with _driver_registry_lock:
+        drivers = list(_driver_registry)
+        _driver_registry.clear()
+
+    for driver in drivers:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+def process_one_in_worker(item):
+    idx, mjai_url, throttle = item
+    pre_delay_min, pre_delay_max, post_delay_min, post_delay_max, rate_limit_backoff = throttle
+    worker_id = getattr(_thread_state, "worker_id", "?")
+    driver = getattr(_thread_state, "driver", None)
+    if driver is None:
+        raise RuntimeError("worker Chrome driver was not initialized")
+
+    delay = random.uniform(pre_delay_min, pre_delay_max)
+    if delay > 0:
+        print(f"\n[worker {worker_id}] cooling {delay:.1f}s before game #{idx}")
+        time.sleep(delay)
+
+    print(f"\n[worker {worker_id}] picked game #{idx}")
+    row = process_one(driver, idx, mjai_url)
+    if looks_like_rate_limited(driver):
+        print(f"[worker {worker_id}] rate limit detected; backing off {rate_limit_backoff}s")
+        time.sleep(rate_limit_backoff)
+
+    delay = random.uniform(post_delay_min, post_delay_max)
+    if delay > 0:
+        print(f"[worker {worker_id}] cooling {delay:.1f}s after game #{idx}")
+        time.sleep(delay)
+
+    print(f"[worker {worker_id}] finished game #{idx}: {row.get('status')}")
+    return row
+
+
+def merge_result(rows_by_mjai, row):
+    mjai_url = row.get("mjai_url")
+    if mjai_url:
+        rows_by_mjai[mjai_url] = row
+
+
+def ordered_rows_for_links(rows_by_mjai, links):
+    ordered = []
+    for idx, mjai_url in links:
+        row = rows_by_mjai.get(mjai_url)
+        if not row:
+            continue
+        row["index"] = idx
+        ordered.append(row)
+    return ordered
+
+
+def run_parallel_games(all_links, links_to_process, rows_by_mjai, output_file, workers, headless, throttle_args):
+    if not links_to_process:
+        return ordered_rows_for_links(rows_by_mjai, all_links)
+
+    throttle = (
+        throttle_args.pre_delay_min,
+        throttle_args.pre_delay_max,
+        throttle_args.post_delay_min,
+        throttle_args.post_delay_max,
+        throttle_args.rate_limit_backoff,
+    )
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="rt-v3",
+        initializer=init_worker,
+        initargs=(headless, throttle_args.start_stagger),
+    ) as executor:
+        futures = [
+            executor.submit(process_one_in_worker, (idx, mjai_url, throttle))
+            for idx, mjai_url in links_to_process
+        ]
+        for future in as_completed(futures):
+            try:
+                row = future.result()
+            except Exception as exc:
+                print(f"[error] Worker failed: {exc.__class__.__name__}: {exc}")
+                continue
+
+            merge_result(rows_by_mjai, row)
+            checkpoint_rows = ordered_rows_for_links(rows_by_mjai, all_links)
+            write_csv(output_file, checkpoint_rows)
+            print(f"  [save] checkpoint: {output_file}")
+
+    close_worker_drivers()
+    return ordered_rows_for_links(rows_by_mjai, all_links)
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Conservative v2 RT/rating lookup tool.")
+    parser = argparse.ArgumentParser(description="Parallel v3 RT/rating lookup tool.")
     parser.add_argument("--nickname", help="player nickname")
     parser.add_argument("--player-id", help="skip nickname search and use this player id")
     parser.add_argument("--room", choices=["9", "12"], help="9=gold room, 12=jade room")
     parser.add_argument("--games", type=int, help="number of recent games to query")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"parallel Chrome workers for games; default {DEFAULT_WORKERS}",
+    )
+    parser.add_argument(
+        "--start-stagger",
+        type=float,
+        default=DEFAULT_START_STAGGER,
+        help=f"seconds to stagger Chrome worker startup; default {DEFAULT_START_STAGGER}",
+    )
+    parser.add_argument(
+        "--pre-delay-min",
+        type=float,
+        default=DEFAULT_PRE_DELAY_MIN,
+        help=f"minimum random delay before each game; default {DEFAULT_PRE_DELAY_MIN}",
+    )
+    parser.add_argument(
+        "--pre-delay-max",
+        type=float,
+        default=DEFAULT_PRE_DELAY_MAX,
+        help=f"maximum random delay before each game; default {DEFAULT_PRE_DELAY_MAX}",
+    )
+    parser.add_argument(
+        "--post-delay-min",
+        type=float,
+        default=DEFAULT_POST_DELAY_MIN,
+        help=f"minimum random delay after each game; default {DEFAULT_POST_DELAY_MIN}",
+    )
+    parser.add_argument(
+        "--post-delay-max",
+        type=float,
+        default=DEFAULT_POST_DELAY_MAX,
+        help=f"maximum random delay after each game; default {DEFAULT_POST_DELAY_MAX}",
+    )
+    parser.add_argument(
+        "--rate-limit-backoff",
+        type=float,
+        default=DEFAULT_RATE_LIMIT_BACKOFF,
+        help=f"seconds to pause a worker after a rate-limit page is detected; default {DEFAULT_RATE_LIMIT_BACKOFF}",
+    )
     parser.add_argument("--headless", action="store_true", help="run headless; not recommended with Cloudflare")
-    parser.add_argument("--reset-profile", action="store_true", help="delete v2 Chrome profile before running")
+    parser.add_argument("--reset-profile", action="store_true", help="delete v3 Chrome profiles before running")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    if args.reset_profile and PROFILE_DIR.exists():
-        shutil.rmtree(PROFILE_DIR)
-        print(f"[profile] Removed profile: {PROFILE_DIR}")
+    if args.reset_profile and PROFILE_ROOT.exists():
+        shutil.rmtree(PROFILE_ROOT)
+        print(f"[profile] Removed profiles: {PROFILE_ROOT}")
 
     nickname = args.nickname or input("nickname: ").strip()
-    room = args.room or input("room id (9=gold, 12=jade): ").strip()
+    room = args.room or input("room id (9=gold, 12=jade, 16=throne): ").strip()
     games_text = args.games or input("number of recent games: ").strip()
     games = int(games_text)
+    workers = max(1, int(args.workers))
+    if args.pre_delay_max < args.pre_delay_min:
+        args.pre_delay_max = args.pre_delay_min
+    if args.post_delay_max < args.post_delay_min:
+        args.post_delay_max = args.post_delay_min
+    if workers > MAX_RECOMMENDED_WORKERS:
+        print(
+            f"[warn] --workers {workers} may be too heavy. "
+            f"{MAX_RECOMMENDED_WORKERS} or less is recommended unless your machine/network can handle it."
+        )
 
     if not args.headless:
         print("[mode] Visible Chrome is the default. This is recommended for manual Cloudflare verification.")
     else:
         print("[mode] Headless enabled. If Cloudflare appears, this may fail.")
+    print(f"[mode] Parallel game workers: {workers}")
+    print(
+        "[mode] Throttle: "
+        f"startup stagger={args.start_stagger}s, "
+        f"pre={args.pre_delay_min}-{args.pre_delay_max}s, "
+        f"post={args.post_delay_min}-{args.post_delay_max}s, "
+        f"rate-limit backoff={args.rate_limit_backoff}s"
+    )
 
-    driver = build_driver(headless=args.headless)
+    driver = build_driver(headless=args.headless, profile_dir=LINK_PROFILE_DIR)
     try:
         player_id = args.player_id or get_player_id_by_nickname(driver, nickname)
         if not player_id:
@@ -611,38 +821,57 @@ def main():
 
         room_name = ROOM_NAMES.get(room, room)
         safe_nickname = re.sub(r'[\\/:*?"<>|]+', "_", nickname) or player_id
-        output_file = OUTPUT_DIR / f"{safe_nickname}_{room_name}_recent_{games}_v2.csv"
+        output_file = OUTPUT_DIR / f"{safe_nickname}_{room_name}_recent_{games}_v3.csv"
         existing = read_existing_csv(output_file)
 
         links = extract_latest_mjai_links(driver, player_id, room, games)
         if not links:
             print("[error] No MJAI links found.")
             return
+        try:
+            driver.quit()
+            driver = None
+            print("[links] Link-fetch Chrome closed before starting worker pool.")
+        except Exception:
+            pass
 
-        results = []
+        rows_by_mjai = {}
+        links_to_process = []
         for idx, mjai_url in links:
             old_row = existing.get(mjai_url)
             if old_row and old_row.get("status") == "OK":
                 print(f"\n[skip] #{idx} already completed.")
                 old_row["index"] = idx
-                results.append(old_row)
+                merge_result(rows_by_mjai, old_row)
                 continue
 
-            row = process_one(driver, idx, mjai_url)
-            results.append(row)
-            write_csv(output_file, results)
-            print(f"  [save] checkpoint: {output_file}")
-            human_sleep(2.5, 5.0)
+            links_to_process.append((idx, mjai_url))
 
+        if links_to_process:
+            print(f"[parallel] Processing {len(links_to_process)} games with {workers} Chrome worker(s).")
+        else:
+            print("[parallel] All requested games were already completed.")
+
+        results = run_parallel_games(
+            links,
+            links_to_process,
+            rows_by_mjai,
+            output_file,
+            workers,
+            args.headless,
+            args,
+        )
         write_csv(output_file, results)
         print(f"\n[done] CSV saved: {output_file}")
         summarize(results)
 
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        close_worker_drivers()
 
 
 if __name__ == "__main__":
