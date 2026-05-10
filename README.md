@@ -1,131 +1,149 @@
 # majsoul-mortal-rating
 
-雀魂对局评分批量提取工具。脚本会从雀魂牌谱屋提取指定玩家在金之间 / 玉之间的最近对局链接，提交到 mortal 页面分析，并把 Rating 与 AI 一致率导出为 CSV。
+一个用于批量查询雀魂牌谱 Mortal/KillerDucky 评分的小工具。
 
-数据来源：
+工具会先在 `amae-koromo.sapk.ch` 根据昵称或 player id 找到最近牌谱，再打开 `mjai.ekyu.moe` 的 AI 工具页提交牌谱，最后从 KillerDucky 页面里的“关于 / About”窗口读取：
 
-- 雀魂牌谱屋：https://amae-koromo.sapk.ch
-- mortal / KillerDucky：https://mjai.ekyu.moe
+- `rating`
+- `ai_consistency`
 
-## 功能
+结果会写入 CSV，并在每局完成后保存 checkpoint，方便中断后继续跑。
 
-- 按昵称搜索玩家 ID，也支持直接传入 `--player-id`
-- 提取金之间 `9` / 玉之间 `12` 最近 N 场带 AI 链接的对局
-- 自动提交到 mortal 分析页面
-- 从 About 弹窗读取 `rating` 与 `ai_consistency`
-- 每完成一局写入一次 CSV，失败后可重跑续查
-- 终端输出平均 Rating 与平均 AI 一致率
+## 推荐版本
 
-## 版本选择
+推荐使用 `查rt工具_v4.py`。
 
-| 脚本 | 适合场景 |
-| --- | --- |
-| `查rt工具_v2.py` | 稳定优先，单 Chrome 顺序处理 |
-| `查rt工具_v3.py` | 加速版，多 Chrome 并行处理，默认 2 workers |
+v4 相比 v3 的主要变化：
 
-建议先用 v2 确认环境可用；批量查询再用 v3。v3 不建议开太多并发，同一 IP 高频访问可能触发 Cloudflare 或 rate limit。
+- 默认 2 个 Chrome worker 并行处理牌谱。
+- 去掉 v3 的每局前后 cooling time。
+- 去掉默认 rate-limit 长时间 backoff。
+- 进入 KillerDucky `.json` 页面后，不再固定等待页面自动加载，直接点击 `id="about"` 的“关于”按钮读取数据。
+- Chrome 启动阶段加锁，避免多个 worker 同时抢 `undetected_chromedriver.exe`。
+- 默认把两个 worker Chrome 窗口左右并排摆放。
+- 终端结束时输出总耗时。
 
-## 安装
+v3 更保守，适合遇到频繁 rate limit 或页面不稳定时回退使用。
 
-需要 Python 3.8+ 与 Google Chrome。
+## 安装依赖
+
+需要 Python 环境和 Google Chrome。
 
 ```bash
 pip install selenium undetected-chromedriver webdriver-manager requests
 ```
 
-如果安装 `undetected-chromedriver` 失败：
+如果 `undetected-chromedriver` 相关依赖异常，可以先升级基础包：
 
 ```bash
 pip install --upgrade pip setuptools
 ```
 
-## 使用
+## 运行 v4
 
-前台 Chrome 更稳定，遇到 Cloudflare 验证时请在打开的浏览器窗口中手动完成。
+交互式运行：
 
-### v2 稳定版
-
-```bash
-python 查rt工具_v2.py --nickname "玩家昵称" --room 12 --games 10
+```powershell
+& E:\Anaconda\envs\rating_tool\python.exe c:/Users/yyt/Desktop/rating/查rt工具/查rt工具_v4.py
 ```
 
-已知玩家 ID 时可跳过昵称搜索：
+也可以直接带参数：
 
-```bash
-python 查rt工具_v2.py --nickname "玩家昵称" --player-id 123456789 --room 12 --games 10
+```powershell
+& E:\Anaconda\envs\rating_tool\python.exe c:/Users/yyt/Desktop/rating/查rt工具/查rt工具_v4.py --nickname "EternityQ" --room 12 --games 20
 ```
 
-### v3 并行版
+已知 player id 时，可以跳过昵称搜索：
 
-```bash
-python 查rt工具_v3.py --nickname "玩家昵称" --room 12 --games 20 --workers 2
+```powershell
+& E:\Anaconda\envs\rating_tool\python.exe c:/Users/yyt/Desktop/rating/查rt工具/查rt工具_v4.py --nickname "EternityQ" --player-id 9139787 --room 12 --games 20
 ```
 
-如果 2 开稳定，可以谨慎尝试 3 开并增加冷却：
-
-```bash
-python 查rt工具_v3.py --nickname "玩家昵称" --room 12 --games 20 --workers 3 --start-stagger 20 --pre-delay-min 8 --pre-delay-max 25 --post-delay-min 15 --post-delay-max 40
-```
-
-不建议长期使用 `--workers 4` 以上；如果出现 rate limit，降低 workers 或等待一段时间再跑。
-
-## 参数
+## 常用参数
 
 | 参数 | 说明 |
 | --- | --- |
-| `--nickname` | 玩家昵称 |
-| `--player-id` | 玩家 ID，传入后跳过昵称搜索 |
-| `--room` | 房间：`9` 金之间，`12` 玉之间 |
-| `--games` | 查询最近 N 场 |
-| `--headless` | 后台模式，不推荐 |
-| `--reset-profile` | 删除对应版本的 Chrome profile 后重跑 |
-| `--workers` | v3 并行 Chrome 数量，默认 2 |
-| `--start-stagger` | v3 worker 启动错峰秒数 |
-| `--pre-delay-min/max` | v3 每局开始前随机等待 |
-| `--post-delay-min/max` | v3 每局结束后随机等待 |
+| `--nickname` | 玩家昵称。 |
+| `--player-id` | 玩家 ID；传入后跳过昵称搜索。 |
+| `--room` | 房间：`9` 金之间，`12` 玉之间。 |
+| `--games` | 查询最近 N 局。 |
+| `--workers` | 并行 Chrome worker 数，默认 `2`。 |
+| `--window-size` | Chrome 窗口大小，默认 `920,660`。 |
+| `--headless` | 无头模式；不推荐，Cloudflare 验证时容易失败。 |
+| `--reset-profile` | 删除 v4 的 Chrome profile 后重新运行。 |
+
+示例：把窗口调小一点：
+
+```powershell
+& E:\Anaconda\envs\rating_tool\python.exe c:/Users/yyt/Desktop/rating/查rt工具/查rt工具_v4.py --window-size 760,560
+```
+
+## Cloudflare 验证
+
+工具默认使用可视 Chrome，因为偶尔会遇到 Cloudflare 验证。
+
+可能出现验证的位置：
+
+- `amae-koromo.sapk.ch` 查询玩家和牌谱时。
+- `mjai.ekyu.moe` / KillerDucky 页面打开时。
+
+如果 Chrome 页面停在 Cloudflare 验证页，或者 mjai 页面要求验证，需要手动在打开的 Chrome 窗口里点一下通过验证。脚本会等待验证结束，然后自动继续。
+
+建议：
+
+- 不要使用 `--headless`，否则看不到验证页面。
+- 验证通过后，Chrome profile 会保留一部分状态，后续同版本运行通常会少一些验证。
+- 如果页面状态异常，可以用 `--reset-profile` 清掉 v4 profile 后再跑。
 
 ## 输出
 
-v2 输出到 `outputs_v2/`，v3 输出到 `outputs_v3/`。
+v4 输出目录：
+
+```text
+outputs_all/
+```
 
 CSV 文件名格式：
 
 ```text
-{昵称}_{房间}_recent_{N}_v2.csv
-{昵称}_{房间}_recent_{N}_v3.csv
+{nickname}_{room}_recent_{N}_v4.csv
 ```
 
-字段：
+CSV 字段：
 
 | 字段 | 说明 |
 | --- | --- |
-| `index` | 最近对局序号 |
-| `mjai_url` | mortal 对局页面链接 |
-| `json_url` | 对局 JSON 链接 |
-| `rating` | mortal Rating |
-| `ai_consistency` | AI 一致率 |
-| `status` | `OK` / `PARTIAL` / `ERROR` |
+| `index` | 最近牌谱序号。 |
+| `mjai_url` | mjai 牌谱分析入口。 |
+| `json_url` | KillerDucky report JSON 地址。 |
+| `rating` | Mortal/KillerDucky rating。 |
+| `ai_consistency` | AI 一致率。 |
+| `status` | `OK` / `PARTIAL` / `ERROR`。 |
 
-CSV 使用 UTF-8 BOM 编码，通常可直接用 Excel / WPS 打开。
+文件使用 UTF-8 BOM 写入，方便 Excel / WPS 直接打开。
+
+## 版本说明
+
+| 文件 | 说明 |
+| --- | --- |
+| `查rt工具_v4.py` | 当前推荐快版；2 worker 并行，去掉 cooling，直接读 About。 |
+| `查rt工具_v3.py` | 保守并行版；有启动错峰、每局前后 cooling 和 rate-limit backoff。 |
+| `查rt工具_v2.py` | 旧版单流程脚本。 |
 
 ## 常见问题
 
-**触发 Cloudflare 验证**
+**启动时卡在下载或查找 ChromeDriver**
 
-在打开的 Chrome 窗口中手动完成验证，脚本会自动继续。验证状态会保存在对应的 `chrome_user_data_v2` 或 `chrome_user_data_v3` 目录。
+`undetected_chromedriver` 启动前可能需要访问 Google 的 Chrome for Testing 地址。如果当前网络连不上，可能需要让 Python 走代理。
 
-**v3 出现 rate limit**
+**只有一个 Chrome 在动**
 
-降低 `--workers`，推荐先用 2。若 3 开也不稳定，增加 `--start-stagger` 和每局前后 delay，或等待一段时间后重跑。
+v4 为了避免 `undetected_chromedriver.exe` 文件竞争，Chrome 启动阶段是加锁串行的。两个 worker 不一定完全同时开始，但进入处理牌谱后会并行。
 
-**没有找到 AI 对局链接**
+**出现 `PARTIAL` 或 `ERROR`**
 
-该玩家最近在对应房间可能没有带 AI 标签的对局，换房间、增加场数或换玩家再试。
+常见原因是页面没加载完整、Cloudflare 验证未完成、mjai/KillerDucky 短时异常、或 About 数据暂时没读到。可以直接重跑，已有 `OK` 的行会被跳过。
 
-**结果中有 ERROR / PARTIAL**
+**频繁 rate limit**
 
-可能是页面加载慢、网络波动、Cloudflare、rate limit 或 About 数据尚未生成。脚本会保存已完成结果，可直接重跑补齐。
-
-## 说明
-
-本工具仅用于个人学习与研究。请控制查询频率，遵守目标网站的使用条款。
+先把 `--workers` 降到 `1` 或回退 v3。v4 是个人自用快版，默认不做长时间退避。
