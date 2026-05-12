@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Parallel v3 for the RT/rating lookup tool.
+Parallel v4 for the RT/rating lookup tool.
 
-Compared with v2:
+Compared with v3:
 - keeps the conservative Cloudflare/manual-verification behavior
-- fetches recent MJAI links with one Chrome instance
-- processes games with a small pool of independent Chrome instances
-- gives every worker its own persistent Chrome profile
-- defaults to visible Chrome; headless is optional and not recommended
-- writes a CSV checkpoint after every game, so reruns can skip completed rows
+- removes default cooling delays before/after each game
+- clicks the KillerDucky About button as soon as the JSON page opens
+- records total elapsed time in the final CSV summary and console output
 """
 
 import argparse
@@ -34,29 +32,35 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 
 BASE_DIR = Path(__file__).resolve().parent
-PROFILE_ROOT = BASE_DIR / "chrome_user_data_v3"
+PROFILE_ROOT = BASE_DIR / "chrome_user_data_v4"
 LINK_PROFILE_DIR = PROFILE_ROOT / "link_fetch"
 OUTPUT_DIR = BASE_DIR / "outputs_all"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 ROOM_NAMES = {"9": "gold", "12": "jade"}
 CSV_FIELDS = ["index", "mjai_url", "json_url", "rating", "ai_consistency", "status"]
-KILLERDUCKY_SETTLE_SECONDS = 8
+KILLERDUCKY_SETTLE_SECONDS = 0
 ABOUT_VALUES_MAX_WAIT = 150
-DEFAULT_WORKERS = 3
+HOME_PAGE_GRACE_SECONDS = 30
+DEFAULT_WORKERS = 2
 MAX_RECOMMENDED_WORKERS = 4
-DEFAULT_START_STAGGER = 10
-DEFAULT_PRE_DELAY_MIN = 3
-DEFAULT_PRE_DELAY_MAX = 12
-DEFAULT_POST_DELAY_MIN = 8
-DEFAULT_POST_DELAY_MAX = 22
+DEFAULT_START_STAGGER = 5
+DEFAULT_PRE_DELAY_MIN = 0
+DEFAULT_PRE_DELAY_MAX = 0
+DEFAULT_POST_DELAY_MIN = 0
+DEFAULT_POST_DELAY_MAX = 0
 DEFAULT_RATE_LIMIT_BACKOFF = 180
 
 _thread_state = threading.local()
 _worker_counter = itertools.count(1)
 _worker_counter_lock = threading.Lock()
+_driver_start_lock = threading.Lock()
 _driver_registry = []
 _driver_registry_lock = threading.Lock()
+
+
+class WorkerBrowserNeedsRestart(RuntimeError):
+    """Raised when a worker Chrome tab falls back to a browser home/blank page."""
 
 
 def human_sleep(a=0.6, b=1.4):
@@ -195,6 +199,108 @@ def looks_like_rate_limited(driver):
     return any(marker in title or marker in html for marker in markers)
 
 
+def looks_like_browser_home(driver):
+    try:
+        url = (driver.current_url or "").strip().lower()
+        title = (driver.title or "").strip().lower()
+        html = (driver.page_source or "")[:5000].lower()
+    except Exception:
+        return True
+
+    home_urls = (
+        "about:blank",
+        "chrome://newtab",
+        "chrome://new-tab-page",
+        "chrome://welcome",
+        "chrome://version",
+        "https://www.google.com/",
+        "https://www.google.com.hk/",
+        "https://www.google.com/search",
+        "https://www.google.com/webhp",
+    )
+    home_titles = (
+        "",
+        "new tab",
+        "新标签页",
+        "google",
+    )
+    home_markers = (
+        "在 google 中搜索或输入网址",
+        "依次按 tab 键和 enter 键即可问问 ai 模式",
+        "ask ai mode",
+    )
+    return (
+        url.startswith(home_urls)
+        or (url.startswith("chrome://") and title in home_titles)
+        or (title in home_titles and any(marker in html for marker in home_markers))
+    )
+
+
+def raise_if_browser_home(driver, context, grace_seconds=0):
+    if looks_like_browser_home(driver):
+        if grace_seconds > 0:
+            end = time.time() + grace_seconds
+            print(f"  [wait] Browser is on home/new-tab page; giving it {grace_seconds}s to load ({context}).")
+            while time.time() < end:
+                time.sleep(1)
+                if not looks_like_browser_home(driver):
+                    return
+        try:
+            url = driver.current_url
+        except Exception:
+            url = "<unavailable>"
+        raise WorkerBrowserNeedsRestart(f"{context}: worker browser is on {url}")
+
+
+def raise_if_not_expected_page(driver, expected_host, context, grace_seconds=0):
+    end = time.time() + grace_seconds
+    last_url = ""
+    while True:
+        raise_if_browser_home(driver, context, grace_seconds=grace_seconds)
+        try:
+            url = (driver.current_url or "").strip()
+        except Exception:
+            raise WorkerBrowserNeedsRestart(f"{context}: worker browser has no readable current URL")
+
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if host == expected_host or "challenges.cloudflare.com" in host:
+            return
+        last_url = url
+        if time.time() >= end:
+            break
+        time.sleep(1)
+
+    raise WorkerBrowserNeedsRestart(f"{context}: expected {expected_host}, got {last_url}")
+
+
+def wait_for_expected_page(driver, expected_host, context, max_wait=HOME_PAGE_GRACE_SECONDS):
+    end = time.time() + max_wait
+    last_url = ""
+    while time.time() < end:
+        if looks_like_browser_home(driver):
+            time.sleep(1)
+            continue
+        try:
+            url = (driver.current_url or "").strip()
+        except Exception:
+            time.sleep(1)
+            continue
+
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if host == expected_host or "challenges.cloudflare.com" in host:
+            return True
+        last_url = url
+        time.sleep(1)
+
+    try:
+        last_url = driver.current_url
+    except Exception:
+        last_url = "<unavailable>"
+    raise WorkerBrowserNeedsRestart(f"{context}: expected {expected_host}, got {last_url}")
+
+
 def wait_if_cloudflare(driver, max_wait=240):
     if not looks_like_cloudflare(driver):
         return True
@@ -221,6 +327,8 @@ def wait_for_submit_or_killerducky(driver, max_wait=300):
     last_notice = 0
 
     while time.time() - start < max_wait:
+        raise_if_browser_home(driver, "waiting for submit", grace_seconds=HOME_PAGE_GRACE_SECONDS)
+
         if "/killerducky/" in (driver.current_url or ""):
             return "killerducky"
 
@@ -377,7 +485,18 @@ def average_ai_consistency(rows):
     return sum(consistencies) / len(consistencies) if consistencies else None
 
 
-def write_csv(path, rows):
+def format_duration(seconds):
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def write_csv(path, rows, elapsed_seconds=None):
     tmp_path = path.with_suffix(".tmp")
     with tmp_path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.writer(file)
@@ -386,6 +505,7 @@ def write_csv(path, rows):
 
         writer.writerow(
             CSV_FIELDS
+            + ["total_duration", format_duration(elapsed_seconds) if elapsed_seconds is not None else ""]
             + ["", ""]
             + ["rating均值：", f"{rating_avg:.2f}" if rating_avg is not None else ""]
         )
@@ -400,15 +520,17 @@ def write_csv(path, rows):
                         "一致率均值：",
                         f"{consistency_avg:.2f}%" if consistency_avg is not None else "",
                     ]
-                writer.writerow([row.get(field, "") for field in CSV_FIELDS] + ["", ""] + summary_cells)
+                writer.writerow([row.get(field, "") for field in CSV_FIELDS] + ["", ""] + ["", ""] + summary_cells)
     tmp_path.replace(path)
 
 
 def click_submit_and_wait_killerducky(driver, mjai_url):
     if not safe_get(driver, mjai_url):
         return None
+    wait_for_expected_page(driver, "mjai.ekyu.moe", "opening MJAI page")
     if not wait_if_cloudflare(driver):
         return None
+    wait_for_expected_page(driver, "mjai.ekyu.moe", "opening MJAI page")
 
     submit_btn = wait_for_submit_or_killerducky(driver, max_wait=300)
     if submit_btn is None:
@@ -424,6 +546,7 @@ def click_submit_and_wait_killerducky(driver, mjai_url):
 
     start = time.time()
     while time.time() - start < 150:
+        raise_if_browser_home(driver, "waiting for KillerDucky page", grace_seconds=HOME_PAGE_GRACE_SECONDS)
         if "/killerducky/" in driver.current_url:
             return driver.current_url
         wait_if_cloudflare(driver, max_wait=12)
@@ -433,6 +556,8 @@ def click_submit_and_wait_killerducky(driver, mjai_url):
 
 
 def wait_after_killerducky_open(driver, seconds=KILLERDUCKY_SETTLE_SECONDS):
+    if seconds <= 0:
+        return
     print(f"  [wait] KillerDucky JSON page opened; waiting {seconds}s for analysis to finish.")
     end = time.time() + seconds
     while time.time() < end:
@@ -446,6 +571,8 @@ def read_cell_text(element):
 
 def find_about_button(driver, timeout=45):
     selectors = [
+        (By.ID, "about"),
+        (By.CSS_SELECTOR, "button#about"),
         (By.XPATH, "//button[contains(normalize-space(.), 'About')]"),
         (By.XPATH, "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'about')]"),
         (By.CSS_SELECTOR, "button[data-bs-target='#about-modal']"),
@@ -454,6 +581,8 @@ def find_about_button(driver, timeout=45):
 
     end = time.time() + timeout
     while time.time() < end:
+        raise_if_browser_home(driver, "waiting for About button", grace_seconds=HOME_PAGE_GRACE_SECONDS)
+
         if looks_like_cloudflare(driver):
             wait_if_cloudflare(driver, max_wait=30)
             continue
@@ -482,6 +611,7 @@ def extract_about_values(driver, max_wait=ABOUT_VALUES_MAX_WAIT):
     ai_consistency = "N/A"
 
     while time.time() - start < max_wait:
+        raise_if_browser_home(driver, "extracting About values", grace_seconds=HOME_PAGE_GRACE_SECONDS)
         about_btn = find_about_button(driver, timeout=8)
         if about_btn is None:
             print("  [wait] About button not ready yet.")
@@ -489,9 +619,7 @@ def extract_about_values(driver, max_wait=ABOUT_VALUES_MAX_WAIT):
             continue
 
         try:
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", about_btn)
-            human_sleep(0.2, 0.5)
-            about_btn.click()
+            driver.execute_script("arguments[0].click();", about_btn)
             WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "about-modal")))
         except (TimeoutException, WebDriverException):
             time.sleep(2)
@@ -620,14 +748,56 @@ def next_worker_id():
 def init_worker(headless, start_stagger):
     worker_id = next_worker_id()
     profile_dir = PROFILE_ROOT / f"worker_{worker_id}"
-    print(f"[worker {worker_id}] Starting Chrome with profile: {profile_dir}")
     time.sleep((worker_id - 1) * start_stagger)
-    driver = build_driver(headless=headless, profile_dir=profile_dir)
+
+    # undetected_chromedriver is fragile when several Chrome instances are
+    # created at exactly the same time. Keep game processing parallel, but
+    # serialize only the browser startup handshake.
+    with _driver_start_lock:
+        print(f"[worker {worker_id}] Starting Chrome with profile: {profile_dir}")
+        driver = build_driver(headless=headless, profile_dir=profile_dir)
+        print(f"[worker {worker_id}] Chrome ready.")
+
     _thread_state.worker_id = worker_id
     _thread_state.driver = driver
+    _thread_state.headless = headless
+    _thread_state.profile_dir = profile_dir
 
     with _driver_registry_lock:
         _driver_registry.append(driver)
+
+
+def unregister_driver(driver):
+    with _driver_registry_lock:
+        try:
+            _driver_registry.remove(driver)
+        except ValueError:
+            pass
+
+
+def restart_current_worker_driver(reason):
+    worker_id = getattr(_thread_state, "worker_id", "?")
+    headless = getattr(_thread_state, "headless", False)
+    profile_dir = getattr(_thread_state, "profile_dir", PROFILE_ROOT / f"worker_{worker_id}")
+    old_driver = getattr(_thread_state, "driver", None)
+
+    print(f"[worker {worker_id}] browser restart requested: {reason}")
+    if old_driver is not None:
+        unregister_driver(old_driver)
+        try:
+            old_driver.quit()
+        except Exception:
+            pass
+
+    with _driver_start_lock:
+        print(f"[worker {worker_id}] Reopening Chrome with profile: {profile_dir}")
+        new_driver = build_driver(headless=headless, profile_dir=profile_dir)
+        print(f"[worker {worker_id}] Chrome reopened.")
+
+    _thread_state.driver = new_driver
+    with _driver_registry_lock:
+        _driver_registry.append(new_driver)
+    return new_driver
 
 
 def close_worker_drivers():
@@ -656,7 +826,25 @@ def process_one_in_worker(item):
         time.sleep(delay)
 
     print(f"\n[worker {worker_id}] picked game #{idx}")
-    row = process_one(driver, idx, mjai_url)
+    for restart_attempt in range(2):
+        try:
+            row = process_one(driver, idx, mjai_url)
+            break
+        except WorkerBrowserNeedsRestart as exc:
+            if restart_attempt >= 1:
+                print(f"[worker {worker_id}] browser returned home again; marking game #{idx} as ERROR")
+                row = {
+                    "index": idx,
+                    "mjai_url": mjai_url,
+                    "json_url": "ERROR",
+                    "rating": "ERROR",
+                    "ai_consistency": "ERROR",
+                    "status": "ERROR",
+                }
+                break
+            driver = restart_current_worker_driver(str(exc))
+            print(f"[worker {worker_id}] retrying game #{idx} after browser restart")
+
     if looks_like_rate_limited(driver):
         print(f"[worker {worker_id}] rate limit detected; backing off {rate_limit_backoff}s")
         time.sleep(rate_limit_backoff)
@@ -700,7 +888,7 @@ def run_parallel_games(all_links, links_to_process, rows_by_mjai, output_file, w
     )
     with ThreadPoolExecutor(
         max_workers=workers,
-        thread_name_prefix="rt-v3",
+        thread_name_prefix="rt-v4",
         initializer=init_worker,
         initargs=(headless, throttle_args.start_stagger),
     ) as executor:
@@ -725,7 +913,7 @@ def run_parallel_games(all_links, links_to_process, rows_by_mjai, output_file, w
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Parallel v3 RT/rating lookup tool.")
+    parser = argparse.ArgumentParser(description="Parallel v4 RT/rating lookup tool.")
     parser.add_argument("--nickname", help="player nickname")
     parser.add_argument("--player-id", help="skip nickname search and use this player id")
     parser.add_argument("--room", choices=["9", "12"], help="9=gold room, 12=jade room")
@@ -773,11 +961,12 @@ def parse_args():
         help=f"seconds to pause a worker after a rate-limit page is detected; default {DEFAULT_RATE_LIMIT_BACKOFF}",
     )
     parser.add_argument("--headless", action="store_true", help="run headless; not recommended with Cloudflare")
-    parser.add_argument("--reset-profile", action="store_true", help="delete v3 Chrome profiles before running")
+    parser.add_argument("--reset-profile", action="store_true", help="delete v4 Chrome profiles before running")
     return parser.parse_args()
 
 
 def main():
+    run_started = time.time()
     args = parse_args()
 
     if args.reset_profile and PROFILE_ROOT.exists():
@@ -805,7 +994,7 @@ def main():
         print("[mode] Headless enabled. If Cloudflare appears, this may fail.")
     print(f"[mode] Parallel game workers: {workers}")
     print(
-        "[mode] Throttle: "
+        "[mode] Timing: "
         f"startup stagger={args.start_stagger}s, "
         f"pre={args.pre_delay_min}-{args.pre_delay_max}s, "
         f"post={args.post_delay_min}-{args.post_delay_max}s, "
@@ -821,7 +1010,7 @@ def main():
 
         room_name = ROOM_NAMES.get(room, room)
         safe_nickname = re.sub(r'[\\/:*?"<>|]+', "_", nickname) or player_id
-        output_file = OUTPUT_DIR / f"{safe_nickname}_{room_name}_recent_{games}_v3.csv"
+        output_file = OUTPUT_DIR / f"{safe_nickname}_{room_name}_recent_{games}_v4.csv"
         existing = read_existing_csv(output_file)
 
         links = extract_latest_mjai_links(driver, player_id, room, games)
@@ -861,8 +1050,10 @@ def main():
             args.headless,
             args,
         )
-        write_csv(output_file, results)
+        elapsed_seconds = time.time() - run_started
+        write_csv(output_file, results, elapsed_seconds=elapsed_seconds)
         print(f"\n[done] CSV saved: {output_file}")
+        print(f"[done] Total duration: {format_duration(elapsed_seconds)}")
         summarize(results)
 
     finally:
