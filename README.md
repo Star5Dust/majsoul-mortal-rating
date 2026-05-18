@@ -1,138 +1,114 @@
-# 查 RT 工具
+﻿# 查 RT 工具
 
-自动从 雀魂牌谱屋`amae-koromo.sapk.ch` 找到最近牌谱的 MJAI 链接，提交到 mortal`mjai.ekyu.moe` / KillerDucky，读取 About 里的：
+当前最新版：`查rt工具_v5.py`
 
-- mortal评分`rating`
-- 一致率`ai_consistency`
+这是一个用于自动查询雀魂牌谱屋（`amae-koromo.sapk.ch`）最近 MJAI 对局，提交到 mortal/KillerDucky 并读取 `rating` 和 `ai_consistency` 的工具。结果会保存到 `outputs_all/` 目录下的 CSV 文件。
 
-结果会保存到 `outputs_all/` 下的 CSV。
+## 功能简介
 
-## 推荐版本
+- 自动从玩家页面抓取最近对局的 MJAI 链接
+- 并行启动多个 Chrome worker，加快对局处理速度
+- 自动提交 MJAI 链接到 KillerDucky
+- 读取 `rating` 和 `ai_consistency` 并写入 CSV
+- 支持 checkpoint，不重复处理已完成局
+- v5 自动处理 Cloudflare 1015 速率限制并重试提交
+- v5 使用独立 Chrome profile 目录，避免与旧版本冲突
 
-目前推荐使用：
+## 使用方法
 
-```text
-查rt工具_v4.py
-```
-
-v4 是当前最顺手的版本：并行更稳定、速度快、会自动保存 checkpoint，也会在最终 CSV 里记录总耗时。
-
-## 版本迭代
-
-### 稳定版
-
-文件：`查rt稳定版.py`
-
-早期可用版本，流程比较保守，适合单线程慢慢跑。优点是简单稳定，缺点是速度慢，自动化程度较低。
-
-### v2
-
-文件：`查rt工具_v2.py`
-
-开始把流程整理成更完整的工具脚本，支持自动查玩家、抓最近对局、打开 MJAI、提交分析并读取结果。
-
-### v3
-
-文件：`查rt工具_v3.py`
-
-加入并行 worker，多个 Chrome 同时处理牌谱，速度明显提升。也加入了更多等待、重试和 rate-limit backoff 逻辑。
-
-### v4
-
-文件：`查rt工具_v4.py`
-
-当前推荐版。相比 v3：
-
-- worker 启动更稳，避免多个 Chrome 同时启动时互相打架
-- 默认去掉每局前后的 cooling delay，速度更快
-- KillerDucky JSON 页面打开后会尽快点击 About
-- 如果浏览器掉到新标签页/首页，会自动重启该 worker 并重试当前局
-- CSV 会持续 checkpoint，跑到一半中断也能保留已完成结果
-- 最终 CSV 会记录总耗时
-
-## 使用方式
-
-交互式运行：
+进入仓库目录后运行最新版脚本：
 
 ```powershell
-& E:\Anaconda\envs\rating_tool\python.exe c:/Users/yyt/Desktop/rating/查rt工具/查rt工具_v4.py
+python 查rt工具_v5.py
 ```
 
-直接传参数：
+如果你使用虚拟环境，请先激活对应环境，再运行脚本：
 
 ```powershell
-& E:\Anaconda\envs\rating_tool\python.exe c:/Users/yyt/Desktop/rating/查rt工具/查rt工具_v4.py --nickname "EternityQ" --room 12 --games 20 --workers 2
+python 查rt工具_v5.py --nickname "玩家昵称" --room 12 --games 20 --workers 2
 ```
 
-如果已知 player id，建议直接传，能少一次搜索：
+如果已知 `player-id`，建议直接传入：
 
 ```powershell
-& E:\Anaconda\envs\rating_tool\python.exe c:/Users/yyt/Desktop/rating/查rt工具/查rt工具_v4.py --nickname "EternityQ" --player-id 9139787 --room 12 --games 20 --workers 2
+python 查rt工具_v5.py --nickname "玩家昵称" --player-id 9139787 --room 12 --games 20 --workers 2
 ```
 
-## 参数建议
+如果未传参数，脚本会交互请求 `nickname`、`room`、`games`。
 
-常用参数：
+## 主要参数
 
 | 参数 | 说明 |
 | --- | --- |
 | `--nickname` | 玩家昵称 |
-| `--player-id` | 玩家 ID，已知时推荐填写 |
-| `--room` | 房间，`9`=金之间，`12`=玉之间 |
+| `--player-id` | 玩家 ID，已知时可跳过昵称搜索 |
+| `--room` | 房间类型，`9`=金之间，`12`=玉之间 |
 | `--games` | 查询最近 N 局 |
-| `--workers` | 并行 Chrome 数量 |
-| `--headless` | 无头模式，不推荐，Cloudflare 时容易失败 |
-| `--reset-profile` | 删除当前版本 Chrome profile 后重新跑 |
+| `--workers` | 并行 Chrome worker 数量，默认 3 |
+| `--headless` | 无头运行，不推荐 Cloudflare 环境下使用 |
+| `--reset-profile` | 删除 v5 Chrome profile 并重新创建 |
+| `--rate-limit-retries` | 遇到 1015 时自动重试次数 |
+| `--rate-limit-min` | 1015 重试最小等待时间 |
+| `--rate-limit-max` | 1015 重试最大等待时间 |
 
-worker 建议：
+建议：
 
-- 推荐：`--workers 2`
-- 更稳但慢：`--workers 1`
-- 不太推荐：`--workers 3` 或更多，比较容易触发 rate limited
+- 推荐使用 `--workers 2` 或 `3`
+- 对抗 Cloudflare 时，`--workers 1` 更稳
+- `--headless` 不建议开启，容易影响验证
 
-## Rate Limited
+## 输出说明
 
-如果出现 Cloudflare `Error 1015` / `You are being rate limited`，一般不是脚本坏了，而是请求太密。
-
-处理建议：
-
-- 等一会儿再继续
-- 手动刷新几次，有时会恢复
-- 如果 Chrome 弹出“确认重新提交表单”，点“继续”
-- 降低并行数，优先用 `--workers 2`
-- 频繁触发时改用 `--workers 1`
-
-可以加大等待：
-
-
-## 输出
-
-结果目录：
+结果保存到：
 
 ```text
 outputs_all/
 ```
 
-v4 输出文件名：
+v5 输出文件名示例：
 
 ```text
-{nickname}_{room}_recent_{N}_v4.csv
+{safe_nickname}_{room_name}_recent_{games}_v5.csv
 ```
 
-CSV 字段：
+常见字段：
 
-| 字段 | 说明 |
-| --- | --- |
-| `index` | 最近第几局 |
-| `mjai_url` | 原始 MJAI 链接 |
-| `json_url` | KillerDucky JSON 链接 |
-| `rating` | rating |
-| `ai_consistency` | AI 一致率 |
-| `status` | `OK` / `PARTIAL` / `ERROR` |
+- `index`：最近第几局
+- `mjai_url`：原始 MJAI 链接
+- `json_url`：KillerDucky JSON 链接
+- `rating`：mortal 评分
+- `ai_consistency`：AI 一致率
+- `status`：`OK` / `PARTIAL` / `ERROR`
+
+## 当前最新版说明
+
+`查rt工具_v5.py` 是当前推荐版本，主要改进：
+
+- 多 worker 并行查询
+- 独立 `chrome_user_data_v5/` profile 管理
+- 继续使用 checkpoint 保存已完成局
+- 自动处理 Cloudflare 1015 rate limit 并重试
+- 避免刷新 POST 页面导致的“重新提交表单”提示
+- 默认可见模式运行，更适合手动通过 Cloudflare 验证
+
+## 版本迭代
+
+- `查rt工具_v2.py`
+  - 整理基础流程：自动查玩家、抓最近对局、打开 MJAI、提交并读取结果
+- `查rt工具_v3.py`
+  - 加入并行 worker，速度明显提升，增加等待和重试逻辑
+- `查rt工具_v4.py`
+  - 更稳定的 worker 启动，自动重启异常 worker，持续 checkpoint，最终 CSV 记录总耗时
+- `查rt工具_v4.1.py`
+  - 在 v4 基础上进一步优化稳定性和恢复逻辑，适合长期批量运行
+- `查rt工具_v5.py`
+  - 当前最新版，增加 Cloudflare 自动重试、独立 profile、专属 v5 CSV 输出
 
 ## 注意事项
 
-- 不建议开 `--headless`，Cloudflare 验证时需要可见 Chrome。
-- 第一次跑如果遇到 Cloudflare，请在打开的 Chrome 里手动完成验证。
-- v4 使用独立的 `chrome_user_data_v4/`，如果状态异常，可以加 `--reset-profile` 重建 profile。
-- 脚本会边跑边写 checkpoint，中断后重新运行会跳过已完成的 `OK` 行。
+- 不建议启用 `--headless`，Cloudflare 验证在可见 Chrome 下更可靠。
+- 初次运行遇到 Cloudflare，请手动完成验证。
+- 如果出现需要手动框选或点击验证的 Cloudflare 页面，请在浏览器中完成验证后再继续。
+- v5 使用 `chrome_user_data_v5/`，如 profile 异常可加 `--reset-profile`。
+- 脚本会实时写入 CSV，途中中断也会保留已完成数据。
+- 如果遇到 Error 1015 / 限流：降低 `--workers` 并稍后重试。
