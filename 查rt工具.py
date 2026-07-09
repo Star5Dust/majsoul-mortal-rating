@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Parallel v5.1 for the RT/rating lookup tool.
+Parallel v5.1_test for the RT/rating lookup tool.
 
 Compared with v4:
 - automatically retries MJAI submissions when Cloudflare Error 1015/rate limit appears
 - automatically reopens the original MJAI link on Cloudflare verification failures
 - restarts a worker browser once when a single game does not produce expected output in 15s
 - avoids browser refresh on POST pages, so Chrome should not show the resubmit-confirmation box
-- keeps separate v5.1 Chrome profiles and CSV output names
+- keeps separate v5.1_test Chrome profiles and CSV output names
 """
 
 import argparse
@@ -33,7 +33,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 
 BASE_DIR = Path(__file__).resolve().parent
-PROFILE_ROOT = BASE_DIR / "chrome_user_data_v5_1"
+PROFILE_ROOT = BASE_DIR / "chrome_user_data_v5_1_test"
 LINK_PROFILE_DIR = PROFILE_ROOT / "link_fetch"
 OUTPUT_DIR = BASE_DIR / "outputs_all"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -43,8 +43,8 @@ CSV_FIELDS = ["index", "mjai_url", "json_url", "rating", "ai_consistency", "stat
 KILLERDUCKY_SETTLE_SECONDS = 0
 ABOUT_VALUES_MAX_WAIT = 150
 HOME_PAGE_GRACE_SECONDS = 30
-DEFAULT_WORKERS = 2
-MAX_RECOMMENDED_WORKERS = 4
+DEFAULT_WORKERS = 1
+MAX_RECOMMENDED_WORKERS = 2
 DEFAULT_START_STAGGER = 5
 DEFAULT_PRE_DELAY_MIN = 0
 DEFAULT_PRE_DELAY_MAX = 0
@@ -54,7 +54,8 @@ DEFAULT_RATE_LIMIT_BACKOFF = 20
 DEFAULT_RATE_LIMIT_REFRESH_TRIES = 8
 DEFAULT_RATE_LIMIT_REFRESH_MIN = 8
 DEFAULT_RATE_LIMIT_REFRESH_MAX = 45
-DEFAULT_WORKER_STALL_RESTART_SECONDS = 15
+DEFAULT_WORKER_STALL_RESTART_SECONDS = 300
+DEFAULT_CLOUDFLARE_MAX_WAIT = 600
 DEFAULT_BROWSER_WINDOW_SIZE = (980, 540)
 WORKER_WINDOW_MARGIN_X = 28
 WORKER_WINDOW_MARGIN_Y = 42
@@ -280,19 +281,57 @@ def accept_any_prompt(driver):
         return False
 
 
+def current_url_and_host(driver):
+    try:
+        url = (driver.current_url or "").strip()
+    except Exception:
+        return "", ""
+    return url, urlparse(url).netloc.lower()
+
+
+def page_has_mjai_submit_or_result(driver):
+    try:
+        url = driver.current_url or ""
+        if "/killerducky/" in url:
+            return True
+        buttons = driver.find_elements(By.CSS_SELECTOR, 'button[type="submit"][name="submitBtn"]')
+        return any(button.is_displayed() and button.is_enabled() for button in buttons)
+    except Exception:
+        return False
+
+
 def looks_like_cloudflare(driver):
     try:
         url = (driver.current_url or "").lower()
         title = (driver.title or "").lower()
-        html = (driver.page_source or "")[:4000].lower()
+        html = (driver.page_source or "")[:8000].lower()
     except Exception:
         return False
 
+    if page_has_mjai_submit_or_result(driver):
+        return False
+
+    challenge_markers = [
+        "checking your browser",
+        "checking if the site connection is secure",
+        "just a moment",
+        "verify you are human",
+        "cf-challenge",
+        "cf-browser-verification",
+        "cf-turnstile",
+        "challenge-platform",
+        "__cf_chl",
+        "/cdn-cgi/challenge-platform",
+        "needs to review the security of your connection",
+        "challenges.cloudflare.com",
+        "正在检查",
+        "请稍候",
+        "验证您是人类",
+        "请验证您是真人",
+    ]
     return (
         "challenges.cloudflare.com" in url
-        or "just a moment" in title
-        or "checking your browser" in html
-        or "cf-challenge" in html
+        or any(marker in title or marker in html for marker in challenge_markers)
         or "cloudflare" in title
     )
 
@@ -442,7 +481,7 @@ def wait_for_expected_page(driver, expected_host, context, max_wait=HOME_PAGE_GR
     raise WorkerBrowserNeedsRestart(f"{context}: expected {expected_host}, got {last_url}")
 
 
-def wait_if_cloudflare(driver, max_wait=240):
+def wait_if_cloudflare(driver, max_wait=DEFAULT_CLOUDFLARE_MAX_WAIT):
     if not looks_like_cloudflare(driver):
         return True
 
@@ -451,11 +490,23 @@ def wait_if_cloudflare(driver, max_wait=240):
     print("[cloudflare] The script will continue automatically after verification.\n")
 
     start = time.time()
+    last_notice = 0
     while time.time() - start < max_wait:
+        accept_any_prompt(driver)
+        if page_has_mjai_submit_or_result(driver):
+            human_sleep(0.8, 1.5)
+            print("[cloudflare] MJAI page/result is visible; continuing.")
+            return True
         if not looks_like_cloudflare(driver):
             human_sleep(0.8, 1.5)
             print("[cloudflare] Verification appears complete; continuing.")
             return True
+        now = time.time()
+        if now - last_notice > 30:
+            remaining = int(max_wait - (now - start))
+            url, host = current_url_and_host(driver)
+            print(f"[cloudflare] Still waiting for manual verification; {remaining}s left. host={host or '<unknown>'}")
+            last_notice = now
         time.sleep(3)
 
     print("[cloudflare] Still on verification page after waiting. You can rerun later; completed rows are saved.")
@@ -477,8 +528,10 @@ def wait_for_submit_or_killerducky(driver, max_wait=300, cloudflare_max_wait=240
             return "rate_limited"
 
         if looks_like_cloudflare(driver):
+            cloudflare_started = time.time()
             if not wait_if_cloudflare(driver, max_wait=cloudflare_max_wait):
                 return None
+            start += time.time() - cloudflare_started
             continue
 
         try:
@@ -700,12 +753,12 @@ def click_submit_and_wait_killerducky(
         if looks_like_rate_limited(driver):
             rate_limit_sleep(rate_attempt, rate_limit_min, rate_limit_max)
             continue
-        if not wait_if_cloudflare(
-            driver,
-            max_wait=remaining_worker_seconds(attempt_started, worker_stall_seconds, minimum=1),
-        ):
+        cloudflare_seen = looks_like_cloudflare(driver)
+        if not wait_if_cloudflare(driver, max_wait=DEFAULT_CLOUDFLARE_MAX_WAIT):
             print("  [cloudflare] Cloudflare verification did not clear; reopening original MJAI page.")
-            raise WorkerBrowserNeedsRestart(f"Cloudflare did not clear within {worker_stall_seconds}s")
+            raise WorkerBrowserNeedsRestart(f"Cloudflare did not clear within {DEFAULT_CLOUDFLARE_MAX_WAIT}s")
+        if cloudflare_seen:
+            attempt_started = time.time()
         raise_if_worker_stalled(attempt_started, worker_stall_seconds, "clearing Cloudflare before submit")
         wait_for_expected_page(
             driver,
@@ -717,7 +770,7 @@ def click_submit_and_wait_killerducky(
         submit_btn = wait_for_submit_or_killerducky(
             driver,
             max_wait=remaining_worker_seconds(attempt_started, worker_stall_seconds, minimum=1),
-            cloudflare_max_wait=remaining_worker_seconds(attempt_started, worker_stall_seconds, minimum=1),
+            cloudflare_max_wait=DEFAULT_CLOUDFLARE_MAX_WAIT,
         )
         if submit_btn == "rate_limited":
             rate_limit_sleep(rate_attempt, rate_limit_min, rate_limit_max)
@@ -734,20 +787,20 @@ def click_submit_and_wait_killerducky(
                 return None
 
         while True:
-            raise_if_worker_stalled(attempt_started, worker_stall_seconds, "waiting for KillerDucky page")
             accept_any_prompt(driver)
+            if looks_like_cloudflare(driver):
+                if not wait_if_cloudflare(driver, max_wait=DEFAULT_CLOUDFLARE_MAX_WAIT):
+                    print("  [cloudflare] Verification stayed blocked after submit; reopening original MJAI page.")
+                    raise WorkerBrowserNeedsRestart(f"Cloudflare stayed blocked for {DEFAULT_CLOUDFLARE_MAX_WAIT}s")
+                attempt_started = time.time()
+                continue
+            raise_if_worker_stalled(attempt_started, worker_stall_seconds, "waiting for KillerDucky page")
             raise_if_browser_home(driver, "waiting for KillerDucky page", grace_seconds=HOME_PAGE_GRACE_SECONDS)
             if "/killerducky/" in driver.current_url:
                 return driver.current_url
             if looks_like_rate_limited(driver):
                 rate_limit_sleep(rate_attempt, rate_limit_min, rate_limit_max)
                 break
-            if looks_like_cloudflare(driver) and not wait_if_cloudflare(
-                driver,
-                max_wait=remaining_worker_seconds(attempt_started, worker_stall_seconds, minimum=1),
-            ):
-                print("  [cloudflare] Verification stayed blocked after submit; reopening original MJAI page.")
-                raise WorkerBrowserNeedsRestart(f"Cloudflare stayed blocked for {worker_stall_seconds}s")
             time.sleep(2)
 
     print(f"  [warn] Still rate limited after {rate_limit_retries + 1} submit attempts.")
@@ -1162,7 +1215,7 @@ def run_parallel_games(all_links, links_to_process, rows_by_mjai, output_file, w
     )
     with ThreadPoolExecutor(
         max_workers=workers,
-        thread_name_prefix="rt-v5.1",
+        thread_name_prefix="rt-v5.1-test",
     ) as executor:
         futures = [
             executor.submit(
@@ -1188,7 +1241,7 @@ def run_parallel_games(all_links, links_to_process, rows_by_mjai, output_file, w
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Parallel v5.1 RT/rating lookup tool.")
+    parser = argparse.ArgumentParser(description="Parallel v5.1_test RT/rating lookup tool.")
     parser.add_argument("--nickname", help="player nickname")
     parser.add_argument("--player-id", help="skip nickname search and use this player id")
     parser.add_argument("--room", choices=["9", "12"], help="9=gold room, 12=jade room")
@@ -1263,7 +1316,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--headless", action="store_true", help="run headless; not recommended with Cloudflare")
-    parser.add_argument("--reset-profile", action="store_true", help="delete v5.1 Chrome profiles before running")
+    parser.add_argument("--reset-profile", action="store_true", help="delete v5.1_test Chrome profiles before running")
     return parser.parse_args()
 
 
@@ -1320,7 +1373,7 @@ def main():
 
         room_name = ROOM_NAMES.get(room, room)
         safe_nickname = re.sub(r'[\\/:*?"<>|]+', "_", nickname) or player_id
-        output_file = OUTPUT_DIR / f"{safe_nickname}_{room_name}_recent_{games}_v5.1.csv"
+        output_file = OUTPUT_DIR / f"{safe_nickname}_{room_name}_recent_{games}_v5.1_test.csv"
         existing = read_existing_csv(output_file)
 
         links = extract_latest_mjai_links(driver, player_id, room, games)
