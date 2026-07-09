@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Parallel v5 for the RT/rating lookup tool.
+Parallel v5.1 for the RT/rating lookup tool.
 
 Compared with v4:
 - automatically retries MJAI submissions when Cloudflare Error 1015/rate limit appears
+- automatically reopens the original MJAI link on Cloudflare verification failures
+- restarts a worker browser once when a single game does not produce expected output in 15s
 - avoids browser refresh on POST pages, so Chrome should not show the resubmit-confirmation box
-- keeps separate v5 Chrome profiles and CSV output names
+- keeps separate v5.1 Chrome profiles and CSV output names
 """
 
 import argparse
@@ -31,7 +33,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 
 BASE_DIR = Path(__file__).resolve().parent
-PROFILE_ROOT = BASE_DIR / "chrome_user_data_v5"
+PROFILE_ROOT = BASE_DIR / "chrome_user_data_v5_1"
 LINK_PROFILE_DIR = PROFILE_ROOT / "link_fetch"
 OUTPUT_DIR = BASE_DIR / "outputs_all"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -41,7 +43,7 @@ CSV_FIELDS = ["index", "mjai_url", "json_url", "rating", "ai_consistency", "stat
 KILLERDUCKY_SETTLE_SECONDS = 0
 ABOUT_VALUES_MAX_WAIT = 150
 HOME_PAGE_GRACE_SECONDS = 30
-DEFAULT_WORKERS = 3
+DEFAULT_WORKERS = 2
 MAX_RECOMMENDED_WORKERS = 4
 DEFAULT_START_STAGGER = 5
 DEFAULT_PRE_DELAY_MIN = 0
@@ -52,6 +54,11 @@ DEFAULT_RATE_LIMIT_BACKOFF = 20
 DEFAULT_RATE_LIMIT_REFRESH_TRIES = 8
 DEFAULT_RATE_LIMIT_REFRESH_MIN = 8
 DEFAULT_RATE_LIMIT_REFRESH_MAX = 45
+DEFAULT_WORKER_STALL_RESTART_SECONDS = 15
+DEFAULT_BROWSER_WINDOW_SIZE = (980, 540)
+WORKER_WINDOW_MARGIN_X = 28
+WORKER_WINDOW_MARGIN_Y = 42
+WORKER_WINDOW_GAP = 28
 
 _thread_state = threading.local()
 _worker_counter = itertools.count(1)
@@ -116,7 +123,7 @@ def get_chrome_major_version():
     return None
 
 
-def build_driver(headless=False, profile_dir=None):
+def _build_driver_once(headless=False, profile_dir=None):
     profile_dir = Path(profile_dir or LINK_PROFILE_DIR)
     profile_dir.mkdir(parents=True, exist_ok=True)
 
@@ -131,7 +138,7 @@ def build_driver(headless=False, profile_dir=None):
     options.add_argument("--disable-background-timer-throttling")
     options.add_argument("--disable-renderer-backgrounding")
     options.add_argument("--disable-backgrounding-occluded-windows")
-    options.add_argument("--window-size=1280,900")
+    options.add_argument(f"--window-size={DEFAULT_BROWSER_WINDOW_SIZE[0]},{DEFAULT_BROWSER_WINDOW_SIZE[1]}")
 
     if headless:
         options.add_argument("--headless=new")
@@ -145,6 +152,98 @@ def build_driver(headless=False, profile_dir=None):
         driver = uc.Chrome(options=options, use_subprocess=True)
     driver.set_page_load_timeout(45)
     return driver
+
+
+def build_driver(headless=False, profile_dir=None, start_retries=3):
+    last_exc = None
+    start_retries = max(1, int(start_retries))
+    for attempt in range(1, start_retries + 1):
+        try:
+            return _build_driver_once(headless=headless, profile_dir=profile_dir)
+        except WebDriverException as exc:
+            last_exc = exc
+            print(f"[warn] Chrome start failed {attempt}/{start_retries}: {exc.__class__.__name__}")
+            if attempt < start_retries:
+                time.sleep(3 * attempt)
+        except Exception as exc:
+            last_exc = exc
+            print(f"[warn] Chrome start failed {attempt}/{start_retries}: {exc.__class__.__name__}")
+            if attempt < start_retries:
+                time.sleep(3 * attempt)
+    raise last_exc
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def get_available_screen_size(driver):
+    try:
+        size = driver.execute_script(
+            "return [window.screen.availWidth || window.screen.width, "
+            "window.screen.availHeight || window.screen.height];"
+        )
+        width, height = int(size[0]), int(size[1])
+        if width > 0 and height > 0:
+            return width, height
+    except Exception:
+        pass
+    return 1920, 1040
+
+
+def worker_window_rect(driver, worker_id):
+    avail_w, avail_h = get_available_screen_size(driver)
+    margin_x = WORKER_WINDOW_MARGIN_X
+    margin_y = WORKER_WINDOW_MARGIN_Y
+    gap = WORKER_WINDOW_GAP
+
+    usable_w = max(900, avail_w - margin_x * 2 - gap)
+    left_w = clamp(int(usable_w * 0.51), 760, 1040)
+    right_w = max(760, usable_w - left_w)
+    if left_w + right_w + gap + margin_x * 2 > avail_w:
+        overflow = left_w + right_w + gap + margin_x * 2 - avail_w
+        right_w = max(640, right_w - overflow)
+
+    usable_h = max(640, avail_h - margin_y * 2 - gap)
+    top_h = clamp(int(usable_h * 0.48), 400, 540)
+    bottom_h = clamp(usable_h - top_h, 400, 560)
+    overflow = top_h + bottom_h + gap + margin_y * 2 - avail_h
+    if overflow > 0:
+        top_h = max(360, top_h - overflow // 2)
+        bottom_h = max(360, bottom_h - (overflow - overflow // 2))
+
+    left_x = margin_x
+    right_x = min(avail_w - right_w - margin_x, margin_x + left_w + gap)
+    bottom_right_x = max(margin_x, right_x - 40)
+    bottom_right_w = max(640, avail_w - bottom_right_x - margin_x)
+    top_y = margin_y
+    bottom_y = min(avail_h - bottom_h - margin_y, margin_y + top_h + gap)
+
+    slot = (worker_id - 1) % 3
+    cycle = (worker_id - 1) // 3
+    cascade = cycle * 24
+    if slot == 0:
+        rect = (left_x + cascade, top_y + cascade, left_w, top_h)
+    elif slot == 1:
+        rect = (right_x + cascade, top_y + cascade, right_w, top_h)
+    else:
+        rect = (bottom_right_x + cascade, bottom_y + cascade, bottom_right_w, bottom_h)
+
+    x, y, width, height = rect
+    x = max(0, min(x, avail_w - 120))
+    y = max(0, min(y, avail_h - 120))
+    width = max(640, min(width, avail_w - x))
+    height = max(360, min(height, avail_h - y))
+    return int(x), int(y), int(width), int(height)
+
+
+def arrange_worker_window(driver, worker_id):
+    try:
+        x, y, width, height = worker_window_rect(driver, worker_id)
+        driver.set_window_rect(x=x, y=y, width=width, height=height)
+        print(f"[worker {worker_id}] Window placed at {x},{y} size {width}x{height}")
+    except Exception as exc:
+        print(f"[worker {worker_id}] Could not place Chrome window: {exc.__class__.__name__}")
 
 
 def safe_get(driver, url, tries=3):
@@ -225,6 +324,20 @@ def rate_limit_sleep(attempt, min_seconds=DEFAULT_RATE_LIMIT_REFRESH_MIN, max_se
     delay = min(max_seconds, min_seconds * attempt) + random.uniform(0.5, 3.0)
     print(f"  [rate-limit] Error 1015 detected; retrying via original MJAI link in {delay:.1f}s")
     time.sleep(delay)
+
+
+def raise_if_worker_stalled(start_time, max_seconds, context):
+    if max_seconds <= 0:
+        return
+    elapsed = time.time() - start_time
+    if elapsed >= max_seconds:
+        raise WorkerBrowserNeedsRestart(f"{context}: stalled for {elapsed:.1f}s")
+
+
+def remaining_worker_seconds(start_time, max_seconds, minimum=1, fallback=300):
+    if max_seconds <= 0:
+        return fallback
+    return max(minimum, max_seconds - (time.time() - start_time))
 
 
 def looks_like_browser_home(driver):
@@ -349,7 +462,7 @@ def wait_if_cloudflare(driver, max_wait=240):
     return False
 
 
-def wait_for_submit_or_killerducky(driver, max_wait=300):
+def wait_for_submit_or_killerducky(driver, max_wait=300, cloudflare_max_wait=240):
     """Wait through slow Cloudflare/page loads until submit is clickable or output page opens."""
     start = time.time()
     last_notice = 0
@@ -364,7 +477,7 @@ def wait_for_submit_or_killerducky(driver, max_wait=300):
             return "rate_limited"
 
         if looks_like_cloudflare(driver):
-            if not wait_if_cloudflare(driver, max_wait=min(240, max_wait)):
+            if not wait_if_cloudflare(driver, max_wait=cloudflare_max_wait):
                 return None
             continue
 
@@ -561,29 +674,56 @@ def click_submit_and_wait_killerducky(
     rate_limit_retries=DEFAULT_RATE_LIMIT_REFRESH_TRIES,
     rate_limit_min=DEFAULT_RATE_LIMIT_REFRESH_MIN,
     rate_limit_max=DEFAULT_RATE_LIMIT_REFRESH_MAX,
+    worker_stall_seconds=DEFAULT_WORKER_STALL_RESTART_SECONDS,
 ):
     for rate_attempt in range(1, rate_limit_retries + 2):
+        attempt_started = time.time()
         if rate_attempt > 1:
-            print(f"  [rate-limit] Reopening original MJAI page, retry {rate_attempt}/{rate_limit_retries + 1}")
+            print(f"  [retry] Reopening original MJAI page, retry {rate_attempt}/{rate_limit_retries + 1}")
 
         # Do not refresh /review after a POST. Reopening the original MJAI URL avoids
         # Chrome's "confirm form resubmission" dialog and creates a clean submit.
-        if not safe_get(driver, mjai_url):
-            return None
-        wait_for_expected_page(driver, "mjai.ekyu.moe", "opening MJAI page")
+        if worker_stall_seconds > 0:
+            try:
+                driver.set_page_load_timeout(max(5, worker_stall_seconds))
+            except Exception:
+                pass
+        if not safe_get(driver, mjai_url, tries=1):
+            raise WorkerBrowserNeedsRestart("opening original MJAI page failed")
+        raise_if_worker_stalled(attempt_started, worker_stall_seconds, "opening original MJAI page")
+        wait_for_expected_page(
+            driver,
+            "mjai.ekyu.moe",
+            "opening MJAI page",
+            max_wait=remaining_worker_seconds(attempt_started, worker_stall_seconds, minimum=1),
+        )
         if looks_like_rate_limited(driver):
             rate_limit_sleep(rate_attempt, rate_limit_min, rate_limit_max)
             continue
-        if not wait_if_cloudflare(driver):
-            return None
-        wait_for_expected_page(driver, "mjai.ekyu.moe", "opening MJAI page")
+        if not wait_if_cloudflare(
+            driver,
+            max_wait=remaining_worker_seconds(attempt_started, worker_stall_seconds, minimum=1),
+        ):
+            print("  [cloudflare] Cloudflare verification did not clear; reopening original MJAI page.")
+            raise WorkerBrowserNeedsRestart(f"Cloudflare did not clear within {worker_stall_seconds}s")
+        raise_if_worker_stalled(attempt_started, worker_stall_seconds, "clearing Cloudflare before submit")
+        wait_for_expected_page(
+            driver,
+            "mjai.ekyu.moe",
+            "opening MJAI page",
+            max_wait=remaining_worker_seconds(attempt_started, worker_stall_seconds, minimum=1),
+        )
 
-        submit_btn = wait_for_submit_or_killerducky(driver, max_wait=300)
+        submit_btn = wait_for_submit_or_killerducky(
+            driver,
+            max_wait=remaining_worker_seconds(attempt_started, worker_stall_seconds, minimum=1),
+            cloudflare_max_wait=remaining_worker_seconds(attempt_started, worker_stall_seconds, minimum=1),
+        )
         if submit_btn == "rate_limited":
             rate_limit_sleep(rate_attempt, rate_limit_min, rate_limit_max)
             continue
         if submit_btn is None:
-            return None
+            raise WorkerBrowserNeedsRestart(f"submit button/result not ready within {worker_stall_seconds}s")
         if submit_btn != "killerducky":
             try:
                 driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", submit_btn)
@@ -593,8 +733,8 @@ def click_submit_and_wait_killerducky(
                 print(f"  [warn] Could not click submit button: {exc.__class__.__name__}")
                 return None
 
-        start = time.time()
-        while time.time() - start < 150:
+        while True:
+            raise_if_worker_stalled(attempt_started, worker_stall_seconds, "waiting for KillerDucky page")
             accept_any_prompt(driver)
             raise_if_browser_home(driver, "waiting for KillerDucky page", grace_seconds=HOME_PAGE_GRACE_SECONDS)
             if "/killerducky/" in driver.current_url:
@@ -602,10 +742,13 @@ def click_submit_and_wait_killerducky(
             if looks_like_rate_limited(driver):
                 rate_limit_sleep(rate_attempt, rate_limit_min, rate_limit_max)
                 break
-            wait_if_cloudflare(driver, max_wait=12)
+            if looks_like_cloudflare(driver) and not wait_if_cloudflare(
+                driver,
+                max_wait=remaining_worker_seconds(attempt_started, worker_stall_seconds, minimum=1),
+            ):
+                print("  [cloudflare] Verification stayed blocked after submit; reopening original MJAI page.")
+                raise WorkerBrowserNeedsRestart(f"Cloudflare stayed blocked for {worker_stall_seconds}s")
             time.sleep(2)
-        else:
-            return None
 
     print(f"  [warn] Still rate limited after {rate_limit_retries + 1} submit attempts.")
     return None
@@ -625,7 +768,7 @@ def read_cell_text(element):
     return (element.get_attribute("innerText") or element.text or "").strip()
 
 
-def find_about_button(driver, timeout=45):
+def find_about_button(driver, timeout=45, cloudflare_max_wait=30):
     selectors = [
         (By.ID, "about"),
         (By.CSS_SELECTOR, "button#about"),
@@ -640,7 +783,7 @@ def find_about_button(driver, timeout=45):
         raise_if_browser_home(driver, "waiting for About button", grace_seconds=HOME_PAGE_GRACE_SECONDS)
 
         if looks_like_cloudflare(driver):
-            wait_if_cloudflare(driver, max_wait=30)
+            wait_if_cloudflare(driver, max_wait=cloudflare_max_wait)
             continue
 
         for by, selector in selectors:
@@ -668,7 +811,12 @@ def extract_about_values(driver, max_wait=ABOUT_VALUES_MAX_WAIT):
 
     while time.time() - start < max_wait:
         raise_if_browser_home(driver, "extracting About values", grace_seconds=HOME_PAGE_GRACE_SECONDS)
-        about_btn = find_about_button(driver, timeout=8)
+        remaining = max(1, max_wait - (time.time() - start))
+        about_btn = find_about_button(
+            driver,
+            timeout=min(8, remaining),
+            cloudflare_max_wait=min(30, remaining),
+        )
         if about_btn is None:
             print("  [wait] About button not ready yet.")
             time.sleep(2)
@@ -676,7 +824,10 @@ def extract_about_values(driver, max_wait=ABOUT_VALUES_MAX_WAIT):
 
         try:
             driver.execute_script("arguments[0].click();", about_btn)
-            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "about-modal")))
+            remaining = max(1, max_wait - (time.time() - start))
+            WebDriverWait(driver, min(15, remaining)).until(
+                EC.presence_of_element_located((By.ID, "about-modal"))
+            )
         except (TimeoutException, WebDriverException):
             time.sleep(2)
             continue
@@ -732,6 +883,7 @@ def process_one(
     rate_limit_retries=DEFAULT_RATE_LIMIT_REFRESH_TRIES,
     rate_limit_min=DEFAULT_RATE_LIMIT_REFRESH_MIN,
     rate_limit_max=DEFAULT_RATE_LIMIT_REFRESH_MAX,
+    worker_stall_seconds=DEFAULT_WORKER_STALL_RESTART_SECONDS,
 ):
     for attempt in range(1, retries + 2):
         print(f"\n[game] #{idx} attempt {attempt}/{retries + 1}")
@@ -741,6 +893,7 @@ def process_one(
             rate_limit_retries=rate_limit_retries,
             rate_limit_min=rate_limit_min,
             rate_limit_max=rate_limit_max,
+            worker_stall_seconds=worker_stall_seconds,
         )
         if not killerducky_url:
             print("  [warn] Could not reach KillerDucky page.")
@@ -751,7 +904,12 @@ def process_one(
         json_url = f"https://mjai.ekyu.moe{data_path}" if data_path and data_path.endswith(".json") else "ERROR"
 
         wait_after_killerducky_open(driver)
-        rating, ai_consistency = extract_about_values(driver)
+        result_started = time.time()
+        about_wait = worker_stall_seconds if worker_stall_seconds > 0 else ABOUT_VALUES_MAX_WAIT
+        rating, ai_consistency = extract_about_values(
+            driver,
+            max_wait=about_wait,
+        )
         status = "OK" if values_are_complete(rating, ai_consistency) else "PARTIAL"
         print(f"  [game] rating={rating}, ai_consistency={ai_consistency}, status={status}")
         if status == "OK":
@@ -764,8 +922,8 @@ def process_one(
                 "status": status,
             }
 
-        print("  [warn] JSON exists, but rating values were not ready; retrying this game.")
-        time.sleep(5 * attempt)
+        raise_if_worker_stalled(result_started, worker_stall_seconds, "reading KillerDucky result")
+        raise WorkerBrowserNeedsRestart(f"rating values not ready within {about_wait}s")
 
     return {
         "index": idx,
@@ -826,6 +984,8 @@ def init_worker(headless, start_stagger):
     with _driver_start_lock:
         print(f"[worker {worker_id}] Starting Chrome with profile: {profile_dir}")
         driver = build_driver(headless=headless, profile_dir=profile_dir)
+        if not headless:
+            arrange_worker_window(driver, worker_id)
         print(f"[worker {worker_id}] Chrome ready.")
 
     _thread_state.worker_id = worker_id
@@ -835,6 +995,15 @@ def init_worker(headless, start_stagger):
 
     with _driver_registry_lock:
         _driver_registry.append(driver)
+
+
+def ensure_worker_driver(headless, start_stagger):
+    driver = getattr(_thread_state, "driver", None)
+    if driver is not None:
+        return driver
+
+    init_worker(headless, start_stagger)
+    return _thread_state.driver
 
 
 def unregister_driver(driver):
@@ -862,6 +1031,8 @@ def restart_current_worker_driver(reason):
     with _driver_start_lock:
         print(f"[worker {worker_id}] Reopening Chrome with profile: {profile_dir}")
         new_driver = build_driver(headless=headless, profile_dir=profile_dir)
+        if not headless:
+            arrange_worker_window(new_driver, worker_id)
         print(f"[worker {worker_id}] Chrome reopened.")
 
     _thread_state.driver = new_driver
@@ -883,7 +1054,7 @@ def close_worker_drivers():
 
 
 def process_one_in_worker(item):
-    idx, mjai_url, throttle = item
+    idx, mjai_url, throttle, headless, start_stagger = item
     (
         pre_delay_min,
         pre_delay_max,
@@ -893,11 +1064,23 @@ def process_one_in_worker(item):
         rate_limit_retries,
         rate_limit_min,
         rate_limit_max,
+        worker_stall_seconds,
     ) = throttle
+    try:
+        driver = ensure_worker_driver(headless, start_stagger)
+    except Exception as exc:
+        worker_id = getattr(_thread_state, "worker_id", "?")
+        print(f"[worker {worker_id}] Chrome could not start for game #{idx}: {exc.__class__.__name__}")
+        return {
+            "index": idx,
+            "mjai_url": mjai_url,
+            "json_url": "ERROR",
+            "rating": "ERROR",
+            "ai_consistency": "ERROR",
+            "status": "CHROME_START_ERROR",
+        }
+
     worker_id = getattr(_thread_state, "worker_id", "?")
-    driver = getattr(_thread_state, "driver", None)
-    if driver is None:
-        raise RuntimeError("worker Chrome driver was not initialized")
 
     delay = random.uniform(pre_delay_min, pre_delay_max)
     if delay > 0:
@@ -914,11 +1097,12 @@ def process_one_in_worker(item):
                 rate_limit_retries=rate_limit_retries,
                 rate_limit_min=rate_limit_min,
                 rate_limit_max=rate_limit_max,
+                worker_stall_seconds=worker_stall_seconds,
             )
             break
         except WorkerBrowserNeedsRestart as exc:
             if restart_attempt >= 1:
-                print(f"[worker {worker_id}] browser returned home again; marking game #{idx} as ERROR")
+                print(f"[worker {worker_id}] worker stalled again after browser restart; marking game #{idx} as ERROR")
                 row = {
                     "index": idx,
                     "mjai_url": mjai_url,
@@ -974,15 +1158,17 @@ def run_parallel_games(all_links, links_to_process, rows_by_mjai, output_file, w
         throttle_args.rate_limit_retries,
         throttle_args.rate_limit_min,
         throttle_args.rate_limit_max,
+        throttle_args.worker_stall_restart_seconds,
     )
     with ThreadPoolExecutor(
         max_workers=workers,
-        thread_name_prefix="rt-v5",
-        initializer=init_worker,
-        initargs=(headless, throttle_args.start_stagger),
+        thread_name_prefix="rt-v5.1",
     ) as executor:
         futures = [
-            executor.submit(process_one_in_worker, (idx, mjai_url, throttle))
+            executor.submit(
+                process_one_in_worker,
+                (idx, mjai_url, throttle, headless, throttle_args.start_stagger),
+            )
             for idx, mjai_url in links_to_process
         ]
         for future in as_completed(futures):
@@ -1002,7 +1188,7 @@ def run_parallel_games(all_links, links_to_process, rows_by_mjai, output_file, w
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Parallel v5 RT/rating lookup tool.")
+    parser = argparse.ArgumentParser(description="Parallel v5.1 RT/rating lookup tool.")
     parser.add_argument("--nickname", help="player nickname")
     parser.add_argument("--player-id", help="skip nickname search and use this player id")
     parser.add_argument("--room", choices=["9", "12"], help="9=gold room, 12=jade room")
@@ -1067,8 +1253,17 @@ def parse_args():
         default=DEFAULT_RATE_LIMIT_REFRESH_MAX,
         help=f"maximum wait before Error 1015 retry; default {DEFAULT_RATE_LIMIT_REFRESH_MAX}",
     )
+    parser.add_argument(
+        "--worker-stall-restart-seconds",
+        type=float,
+        default=DEFAULT_WORKER_STALL_RESTART_SECONDS,
+        help=(
+            "restart a game worker browser once if one game does not reach its expected output "
+            f"within this many seconds; default {DEFAULT_WORKER_STALL_RESTART_SECONDS}"
+        ),
+    )
     parser.add_argument("--headless", action="store_true", help="run headless; not recommended with Cloudflare")
-    parser.add_argument("--reset-profile", action="store_true", help="delete v5 Chrome profiles before running")
+    parser.add_argument("--reset-profile", action="store_true", help="delete v5.1 Chrome profiles before running")
     return parser.parse_args()
 
 
@@ -1093,6 +1288,8 @@ def main():
         args.rate_limit_retries = 0
     if args.rate_limit_max < args.rate_limit_min:
         args.rate_limit_max = args.rate_limit_min
+    if args.worker_stall_restart_seconds < 0:
+        args.worker_stall_restart_seconds = 0
     if workers > MAX_RECOMMENDED_WORKERS:
         print(
             f"[warn] --workers {workers} may be too heavy. "
@@ -1110,7 +1307,8 @@ def main():
         f"pre={args.pre_delay_min}-{args.pre_delay_max}s, "
         f"post={args.post_delay_min}-{args.post_delay_max}s, "
         f"rate-limit retry={args.rate_limit_retries}x/{args.rate_limit_min}-{args.rate_limit_max}s, "
-        f"post-rate-limit backoff={args.rate_limit_backoff}s"
+        f"post-rate-limit backoff={args.rate_limit_backoff}s, "
+        f"worker-stall restart={args.worker_stall_restart_seconds}s"
     )
 
     driver = build_driver(headless=args.headless, profile_dir=LINK_PROFILE_DIR)
@@ -1122,7 +1320,7 @@ def main():
 
         room_name = ROOM_NAMES.get(room, room)
         safe_nickname = re.sub(r'[\\/:*?"<>|]+', "_", nickname) or player_id
-        output_file = OUTPUT_DIR / f"{safe_nickname}_{room_name}_recent_{games}_v5.csv"
+        output_file = OUTPUT_DIR / f"{safe_nickname}_{room_name}_recent_{games}_v5.1.csv"
         existing = read_existing_csv(output_file)
 
         links = extract_latest_mjai_links(driver, player_id, room, games)
