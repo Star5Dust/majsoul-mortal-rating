@@ -419,7 +419,12 @@ def main():
     room = args.room or input("房间 (9=金之间, 12=玉之间, 16=王座之间): ").strip()
     games = args.games or int(input("最近几局: ").strip())
 
-    player_id = args.player_id or search_player(nickname)
+    player_id = args.player_id
+    if not player_id:
+        try:
+            player_id = search_player(nickname)
+        except urllib.error.HTTPError as exc:
+            print(f"[error] 牌谱屋搜玩家失败：HTTP {exc.code}（429 是限流，可以稍后再试）")
     if not player_id:
         print("[error] 没找到玩家，可以用 --player-id 指定")
         return
