@@ -291,6 +291,7 @@ class MjaiSession:
         self.last_token = None
         self.last_submit = 0.0
         self.on_form = False
+        self.progress_handle = None
 
     def open_form(self):
         open_page(self.driver, MJAI_FORM)
@@ -319,10 +320,14 @@ class MjaiSession:
             self.open_form()
 
     def submit(self, paipu):
-        """返回 /report/xxx.json 路径；失败抛出 RuntimeError。"""
+        """返回 /report/xxx.json 路径；失败抛出 RuntimeError。
+
+        一局只在服务器上建一个分析任务：拿到 /progress?task= 就等它完成，绝不重新提交。
+        只有确定任务没建成（限流、token 无效）时才重试提交。
+        """
         log_url = f"https://game.maj-soul.com/1/?paipu={paipu}"
-        backoff = 20
-        for attempt in range(1, 7):
+        backoff = 30
+        for attempt in range(1, 4):
             if not self.on_form:
                 self.open_form()
             wait = self.min_interval - (time.time() - self.last_submit)
@@ -332,29 +337,67 @@ class MjaiSession:
             self.last_token = self.wait_token()
             t1 = time.time()
             res = self.driver.execute_async_script(JS_SUBMIT, log_url, self.model, 180)
-            t2 = time.time()
-            self.last_submit = t2
+            self.last_submit = time.time()
             status, final_url, text = res.get("status"), res.get("url") or "", res.get("text") or ""
             match = REPORT_RE.search(urllib.parse.unquote(final_url)) or REPORT_RE.search(text)
             if match:
-                print(f"  token {t1 - t0:.1f}s, 分析 {t2 - t1:.1f}s")
+                print(f"  token {t1 - t0:.1f}s, 分析 {time.time() - t1:.1f}s")
                 self.reset_token()
                 return match.group(0)
+            if "/progress" in final_url:
+                # 任务已经建好，在另一个标签页等它跑完；表单页同时重置 Turnstile 给下一局用
+                self.reset_token()
+                path = self.wait_progress(final_url)
+                print(f"  token {t1 - t0:.1f}s, 分析 {time.time() - t1:.1f}s")
+                return path
             lowered = text.lower()
             if status == 429 or "1015" in lowered or "rate limit" in lowered:
-                print(f"  [限流] HTTP {status}，等 {backoff}s 后重试 ({attempt}/6)")
+                print(f"  [限流] HTTP {status}，等 {backoff}s 后重试 ({attempt}/3)")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 300)
-                self.open_form()
+                self.reset_token()
                 continue
-            if "captcha" in lowered:
-                print(f"  [turnstile] token 无效，重新获取 ({attempt}/6)")
+            if status == 403 and "captcha" in lowered:
+                print(f"  [turnstile] token 无效，重新获取 ({attempt}/3)")
                 self.reset_token()
                 continue
             snippet = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text))[:200]
-            print(f"  [warn] 提交没拿到报告：HTTP {status} {final_url} {snippet}")
-            self.open_form()
-        raise RuntimeError("多次提交都没拿到报告")
+            self.reset_token()
+            raise RuntimeError(f"提交后返回了未知页面：HTTP {status} {final_url} {snippet}")
+        raise RuntimeError("提交 3 次都被限流或验证失败")
+
+    def wait_progress(self, progress_url, timeout=300):
+        """在第二个标签页打开排队页，等它跳转到报告。"""
+        form_handle = self.driver.current_window_handle
+        if self.progress_handle not in self.driver.window_handles:
+            self.driver.switch_to.new_window("tab")
+            self.progress_handle = self.driver.current_window_handle
+        else:
+            self.driver.switch_to.window(self.progress_handle)
+        try:
+            open_page(self.driver, progress_url)
+            started = time.time()
+            while time.time() - started < timeout:
+                try:
+                    url = urllib.parse.unquote(self.driver.current_url or "")
+                    match = REPORT_RE.search(url)
+                    if not match and "/progress" in url:
+                        match = REPORT_RE.search(self.driver.execute_script(
+                            "return document.documentElement.outerHTML.slice(0, 20000);") or "")
+                except WebDriverException:
+                    match, url = None, ""
+                if match:
+                    return match.group(0)
+                if url and "/progress" not in url and "/killerducky" not in url and "/report" not in url:
+                    raise RuntimeError(f"排队页跳到了意外地址：{url}")
+                time.sleep(1)
+            raise RuntimeError(f"等了 {timeout}s 分析还没完成：{progress_url}")
+        finally:
+            try:
+                open_page(self.driver, "about:blank")
+            except WebDriverException:
+                pass
+            self.driver.switch_to.window(form_handle)
 
     def fetch_report(self, path):
         try:
