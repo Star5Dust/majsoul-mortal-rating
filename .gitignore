@@ -1,0 +1,25 @@
+# Chrome 登录态 / Cloudflare cookie：绝对不要上传
+chrome_user_data*/
+test_chrome_profile/
+cf_debug/
+*cookies*.json
+
+# 运行输出
+outputs_all/
+outputs_v*/
+reports/
+*.tmp
+
+# Python / 编辑器
+__pycache__/
+*.pyc
+.vscode/
+
+# 本地归档与实验文件（不上传）
+旧版内容/
+mock_challenge/
+cf_autoclick.py
+diag_click.py
+extract_cookies.py
+probe_*.py
+v6_*.py
