@@ -711,7 +711,7 @@ def add_chart_sheets(wb, games, runs):
     data_row = 1
     chart_col = 7
     for room in sorted({st["room"] for st in stats}, key=lambda r: room_order.get(r, 9)):
-        picked = [st for st in stats if st["room"] == room and st["n"] >= RANK_MIN_GAMES][:30]
+        picked = [st for st in stats if st["room"] == room and st["n"] >= RANK_MIN_GAMES]
         if len(picked) < 2:
             continue
         top = data_row
