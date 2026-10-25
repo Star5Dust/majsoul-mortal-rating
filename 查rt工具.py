@@ -658,7 +658,7 @@ def add_chart_sheets(wb, games, runs):
     from openpyxl.chart import BarChart, Reference, ScatterChart, Series
     from openpyxl.chart.shapes import GraphicalProperties
     from openpyxl.formatting.rule import FormulaRule
-    from openpyxl.styles import Font
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.worksheet.datavalidation import DataValidation
 
     if not games:
@@ -737,59 +737,98 @@ def add_chart_sheets(wb, games, runs):
         rank.add_chart(chart, f"L{anchor_row}")
         anchor_row += int(chart.height * 2) + 2
 
-    # 「趋势」：B1 下拉选，B2/B3 是起始行和局数，下面每行一局，超出局数的是 #N/A（图里不画，表里隐藏）
+    # 「趋势」：上面是输入区（B1 选玩家、B2 填最近几局）和统计表（全部 | 最近 N 局），空一行后每行一局；
+    # 超出显示局数的行是 #N/A（图里不画，表里白字藏起来）。起始行放在隐藏的 Z 列。
     trend = wb.create_sheet("趋势", 0)
     capacity = max(max(st["n"] for st in stats), 50)
     latest = f"{runs[-1].get('player')} | {runs[-1].get('room')}" if runs else stats[0]["name"]
     if latest not in groups:
         latest = max(stats, key=lambda st: st["n"])["name"]
     rows_ref = f"'排行'!$A$2:$A${len(stats) + 1}"
-    trend["A1"], trend["B1"] = "选择玩家 ▶", latest
-    trend["A2"], trend["B2"] = "起始行", f"=IFERROR(INDEX('排行'!$K$2:$K${len(stats) + 1},MATCH($B$1,{rows_ref},0)),0)"
-    trend["A3"], trend["B3"] = "局数", f"=IFERROR(INDEX('排行'!$D$2:$D${len(stats) + 1},MATCH($B$1,{rows_ref},0)),0)"
-    trend["D1"], trend["E1"] = "rating均值", f"=IFERROR(INDEX('排行'!$E$2:$E${len(stats) + 1},MATCH($B$1,{rows_ref},0)),\"\")"
-    trend["D2"], trend["E2"] = f"最近{TREND_WINDOW}局", f"=IFERROR(INDEX('排行'!$F$2:$F${len(stats) + 1},MATCH($B$1,{rows_ref},0)),\"\")"
-    trend["D3"], trend["E3"] = "一致率均值%", f"=IFERROR(INDEX('排行'!$I$2:$I${len(stats) + 1},MATCH($B$1,{rows_ref},0)),\"\")"
-    # B4 填数字只看最近几局，留空看全部；E4 是实际显示的局数
-    trend["A4"], trend["C4"] = "显示最近 ▶", "局（留空=全部）"
-    trend["D4"], trend["E4"] = "实际显示", "=IF(AND(ISNUMBER($B$4),$B$4>0),MIN(INT($B$4),$B$3),$B$3)"
-    trend["B1"].font = Font(bold=True, size=12, color="C00000")
-    trend["B4"].font = Font(bold=True, size=12, color="C00000")
-    for ref in ("A1", "A2", "A3", "A4", "D1", "D2", "D3", "D4"):
-        trend[ref].font = Font(bold=True)
-    shown = DataValidation(type="whole", operator="greaterThanOrEqual", formula1="0", allow_blank=True)
-    shown.error, shown.errorTitle = "填一个正整数，留空就是全部", "局数不对"
-    trend.add_data_validation(shown)
-    shown.add("B4")
+    lookup = lambda col, default: (f"=IFERROR(INDEX('排行'!${col}$2:${col}${len(stats) + 1},"
+                                   f"MATCH($B$1,{rows_ref},0)),{default})")
+    pick, start, total, shown = "$B$2", "$Z$2", "$B$5", "$C$5"
+    # 全部和最近 N 局都用同一个 Excel 公式算，四舍五入一致（Python 的 round 对 .xx5 会和 Excel 差 0.01）
+    recent = lambda col, n: (f"=IF({n}>0,ROUND(AVERAGE(INDEX('图表数据'!${col}:${col},{start}+{total}-{n}):"
+                             f"INDEX('图表数据'!${col}:${col},{start}+{total}-1)),2),\"\")")
+
+    yahei = "微软雅黑"
+    thin = Side(style="thin", color="BFBFBF")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_fill = PatternFill("solid", fgColor="DDEBF7")
+    input_fill = PatternFill("solid", fgColor="FFF2CC")
+    center = Alignment(horizontal="center", vertical="center")
+
+    def put(ref, value, bold=False, size=10, color=None, fill=None, fmt=None, border=False, align=center):
+        cell = trend[ref]
+        cell.value = value
+        cell.font = Font(name=yahei, bold=bold, size=size, color=color)
+        cell.alignment = align
+        if fill:
+            cell.fill = fill
+        if fmt:
+            cell.number_format = fmt
+        if border:
+            cell.border = box
+        return cell
+
+    left = Alignment(horizontal="left", vertical="center")
+    put("A1", "选择玩家 ▶", bold=True, align=left)
+    put("B1", latest, bold=True, size=12, color="C00000", fill=input_fill, border=True)
+    trend.merge_cells("B1:D1")
+    put("A2", "显示最近 ▶", bold=True, align=left)
+    put("B2", None, bold=True, size=12, color="C00000", fill=input_fill, border=True)
+    put("C2", "局（留空 = 全部）", size=9, color="808080", align=left)
+    put("Z1", "起始行")
+    put("Z2", lookup("K", 0))
+
+    put("A4", "", fill=head_fill, border=True)
+    put("B4", "全部", bold=True, fill=head_fill, border=True)
+    put("C4", f'="最近 "&{shown}&" 局"', bold=True, fill=head_fill, border=True)
+    stat_rows = [("局数", lookup("D", 0), f"=IF(AND(ISNUMBER({pick}),{pick}>0),MIN(INT({pick}),{total}),{total})", "0"),
+                 ("rating 均值", recent("D", total), recent("D", shown), "0.00"),
+                 ("一致率均值 %", recent("E", total), recent("E", shown), "0.00")]
+    for r, (label, all_value, recent_value, fmt) in enumerate(stat_rows, 5):
+        put(f"A{r}", label, bold=True, fill=PatternFill("solid", fgColor="F2F2F2"), border=True, align=left)
+        put(f"B{r}", all_value, fmt=fmt, border=True)
+        put(f"C{r}", recent_value, bold=True, color="C00000", fmt=fmt, border=True)
+
+    only_n = DataValidation(type="whole", operator="greaterThanOrEqual", formula1="0", allow_blank=True)
+    only_n.error, only_n.errorTitle = "填一个正整数，留空就是全部", "局数不对"
+    trend.add_data_validation(only_n)
+    only_n.add("B2")
     dv = DataValidation(type="list", formula1=f"={rows_ref}", allow_blank=False)
     dv.error, dv.errorTitle = "请从列表里选", "玩家不在列表里"
     trend.add_data_validation(dv)
     dv.add("B1")
 
-    header = 5
-    titles = ["第几局", "对局日期", "rating", "一致率%", f"rating {TREND_WINDOW}局均线", f"一致率 {TREND_WINDOW}局均线"]
+    header = 9
+    titles = ["第几局", "对局日期", "rating", "一致率 %", f"rating {TREND_WINDOW}局均线", f"一致率 {TREND_WINDOW}局均线"]
     for col, title in enumerate(titles, 1):
-        trend.cell(row=header, column=col, value=title).font = Font(bold=True)
+        put(f"{'ABCDEF'[col - 1]}{header}", title, bold=True, fill=head_fill, border=True)
     last = header + capacity
+    formats = [None, None, "0.0", "0.0", "0.00", "0.00"]
     for i in range(1, capacity + 1):
         r = header + i
-        # 只显示最近 $E$4 局：跳过前面 $B$3-$E$4 局；均线仍然往前取够 10 局
-        have = f"$E$4>={i}"
-        src = lambda col, k=i: f"INDEX('图表数据'!${col}:${col},$B$2+$B$3-$E$4+{k - 1})"
-        avg = lambda col, k=i: (f"AVERAGE(INDEX('图表数据'!${col}:${col},$B$2+MAX(0,$B$3-$E$4+{k - TREND_WINDOW})):"
+        # 只显示最近 shown 局：跳过前面 total-shown 局；均线仍然往前取够 10 局
+        have = f"{shown}>={i}"
+        src = lambda col, k=i: f"INDEX('图表数据'!${col}:${col},{start}+{total}-{shown}+{k - 1})"
+        avg = lambda col, k=i: (f"AVERAGE(INDEX('图表数据'!${col}:${col},{start}+MAX(0,{total}-{shown}+{k - TREND_WINDOW})):"
                                 f"{src(col, k)})")
-        trend.cell(row=r, column=1, value=f"=IF({have},{i},NA())")
-        trend.cell(row=r, column=2, value=f"=IF({have},{src('C')},NA())")
-        trend.cell(row=r, column=3, value=f"=IF({have},{src('D')},NA())")
-        trend.cell(row=r, column=4, value=f"=IF({have},{src('E')},NA())")
-        trend.cell(row=r, column=5, value=f"=IF({have},ROUND({avg('D')},2),NA())")
-        trend.cell(row=r, column=6, value=f"=IF({have},ROUND({avg('E')},2),NA())")
+        values = [f"=IF({have},{i},NA())", f"=IF({have},{src('C')},NA())", f"=IF({have},{src('D')},NA())",
+                  f"=IF({have},{src('E')},NA())", f"=IF({have},ROUND({avg('D')},2),NA())",
+                  f"=IF({have},ROUND({avg('E')},2),NA())"]
+        for col, (value, fmt) in enumerate(zip(values, formats)):
+            put(f"{'ABCDEF'[col]}{r}", value, fmt=fmt)
     # #N/A 用白字藏起来（图需要 #N/A 才会跳过这些点）
     trend.conditional_formatting.add(f"A{header + 1}:F{last}",
                                      FormulaRule(formula=[f"ISNA(A{header + 1})"], font=Font(color="FFFFFF")))
-    for col, width in zip("ABCDEF", [12, 12, 9, 9, 15, 15]):
+    for col, width in zip("ABCDEFG", [14, 13, 13, 10, 16, 16, 2]):  # G 列留空，隔开表和图
         trend.column_dimensions[col].width = width
-    trend.column_dimensions["B"].width = 22
+    trend.column_dimensions["Z"].hidden = True
+    for r in (1, 2):
+        trend.row_dimensions[r].height = 22
+    trend.sheet_view.showGridLines = False
     trend.freeze_panes = f"A{header + 1}"
     for sheet in (trend, rank):  # 打印时横向、宽度缩到一页
         sheet.page_setup.orientation = "landscape"
