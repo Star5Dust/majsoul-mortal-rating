@@ -27,18 +27,19 @@ import undetected_chromedriver as uc
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
 
-VERSION = "v6"
+VERSION = "v6.2"
 BASE_DIR = Path(__file__).resolve().parent
-PROFILE_DIR = BASE_DIR / "chrome_user_data_v6"
-OUTPUT_DIR = BASE_DIR / "outputs_all"
-CACHE_FILE = BASE_DIR / "cache" / "reports.jsonl"
+DATA_DIR = BASE_DIR / "data"
+PROFILE_DIR = DATA_DIR / "chrome_profile"
+CACHE_FILE = DATA_DIR / "reports.jsonl"  # 按 牌谱ID+模型 缓存的分析结果
+HISTORY_FILE = DATA_DIR / "history.jsonl"  # 每次查询一行，rt结果.xlsx 由它生成
+EXCEL_FILE = BASE_DIR / "rt结果.xlsx"
 
 AMAE_SITE = "https://amae-koromo.sapk.ch"
 AMAE_API = "https://5-data.amae-koromo.com/api/v2/pl4"
 MJAI = "https://mjai.ekyu.moe"
 MJAI_FORM = f"{MJAI}/zh-cn.html"
-ROOM_NAMES = {"9": "gold", "12": "jade", "16": "throne"}
-CSV_FIELDS = ["index", "rating", "ai_consistency", "matches", "paipu", "report_url", "status"]
+ROOM_NAMES = {"9": "金之间", "12": "玉之间", "16": "王座之间"}
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -72,6 +73,15 @@ def search_player(nickname):
 def encode_account_id(player_id):
     """牌谱链接末尾 _a 后面的视角编码。"""
     return ((7 * int(player_id) + 1117113) ^ 86216345) + 1358437
+
+
+def player_id_from_paipu(paipu):
+    """encode_account_id 的反运算：从 ..._a217758789 里取回玩家 ID。"""
+    match = re.search(r"_a(\d+)$", paipu or "")
+    if not match:
+        return None
+    value = ((int(match.group(1)) - 1358437) ^ 86216345) - 1117113
+    return str(value // 7) if value > 0 and value % 7 == 0 else None
 
 
 # ---------------------------------------------------------------- cache
@@ -522,24 +532,150 @@ def parse_report(report):
     }
 
 
+# ---------------------------------------------------------------- 历史记录 / Excel
+
+def append_history(record):
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with HISTORY_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def load_history():
+    if not HISTORY_FILE.exists():
+        return []
+    runs = []
+    for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
+        try:
+            runs.append(json.loads(line))
+        except ValueError:
+            continue
+    return runs
+
+
+def game_date(paipu):
+    """牌谱 ID 开头是 yymmdd。"""
+    match = re.match(r"(\d{2})(\d{2})(\d{2})-", paipu or "")
+    return f"20{match.group(1)}-{match.group(2)}-{match.group(3)}" if match else ""
+
+
+def mean(values):
+    values = [v for v in values if isinstance(v, (int, float))]
+    return round(sum(values) / len(values), 2) if values else None
+
+
+def export_excel():
+    """用 data/history.jsonl 重新生成 rt结果.xlsx。返回是否成功。"""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError:
+        print("[excel] 没装 openpyxl，跳过 Excel（pip install openpyxl）")
+        return False
+
+    runs = sorted(load_history(), key=lambda r: r.get("time", ""))
+    games = {}
+    for run in runs:
+        for row in run.get("rows", []):
+            if not isinstance(row.get("rating"), (int, float)):
+                continue
+            key = (run.get("player_id") or run.get("player"), run.get("room"), row.get("paipu"))
+            games[key] = (run, row)  # 后面的查询覆盖前面的
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "对局"
+    ws.append(["玩家", "房间", "对局日期", "rating", "一致率%", "一致步数", "牌谱ID", "报告链接", "查询时间", "来源"])
+    ordered = sorted(games.values(), key=lambda item: (item[0].get("player", ""), item[0].get("room", ""),
+                                                       game_date(item[1].get("paipu"))), reverse=True)
+    ordered.sort(key=lambda item: (item[0].get("player", ""), item[0].get("room", "")))
+    for run, row in ordered:
+        ws.append([run.get("player"), run.get("room"), game_date(row.get("paipu")), row.get("rating"),
+                   row.get("ai_consistency"), row.get("matches"), row.get("paipu"), row.get("report_url") or "",
+                   run.get("time"), run.get("source")])
+        url = row.get("report_url")
+        if url:
+            cell = ws.cell(row=ws.max_row, column=8)
+            cell.hyperlink = url
+            cell.font = Font(color="0563C1", underline="single")
+
+    ws2 = wb.create_sheet("查询记录")
+    ws2.append(["查询时间", "玩家", "房间", "局数", "成功", "rating均值", "一致率均值%", "来源"])
+    for run in reversed(runs):
+        ok = [r for r in run.get("rows", []) if isinstance(r.get("rating"), (int, float))]
+        ws2.append([run.get("time"), run.get("player"), run.get("room"), run.get("games"), len(ok),
+                    mean([r["rating"] for r in ok]), mean([r.get("ai_consistency") for r in ok]), run.get("source")])
+
+    widths = {"对局": [16, 9, 12, 8, 9, 10, 50, 60, 18, 12], "查询记录": [18, 16, 9, 6, 6, 11, 12, 12]}
+    for sheet in (ws, ws2):
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for i, width in enumerate(widths[sheet.title]):
+            sheet.column_dimensions[chr(ord("A") + i)].width = width
+
+    try:
+        wb.save(EXCEL_FILE)
+    except PermissionError:
+        print(f"[excel] {EXCEL_FILE.name} 正在被 Excel 打开，没法更新。关掉后运行：python 查rt工具.py --export")
+        return False
+    print(f"[excel] 已更新 {EXCEL_FILE}（{len(games)} 局，{len(runs)} 次查询）")
+    return True
+
+
+OLD_CSV_RE = re.compile(r"^(?P<player>.+)_(?P<room>gold|jade|throne)_recent_(?P<n>\d+)_(?P<ver>v[\w.]+)\.csv$")
+OLD_ROOMS = {"gold": "金之间", "jade": "玉之间", "throne": "王座之间"}
+
+
+def parse_number(text):
+    match = re.search(r"-?\d+(?:\.\d+)?", str(text or ""))
+    return float(match.group(0)) if match else None
+
+
+def import_old_csv(folder):
+    """把旧版本生成的 CSV 导入 history.jsonl（只导入一次，按文件名去重）。"""
+    folder = Path(folder)
+    done = {r.get("import_file") for r in load_history()}
+    imported = 0
+    for path in sorted(folder.glob("*.csv")):
+        match = OLD_CSV_RE.match(path.name)
+        if not match or path.name in done:
+            continue
+        rows = []
+        with path.open(encoding="utf-8-sig", newline="") as f:
+            for rec in csv.DictReader(f):
+                paipu = rec.get("paipu") or paipu_from_mjai_href(rec.get("mjai_url") or "")
+                rating = parse_number(rec.get("rating"))
+                if not paipu or rating is None:
+                    continue
+                consistency = str(rec.get("ai_consistency") or "")
+                frac = re.search(r"(\d+)\s*/\s*(\d+)", consistency)
+                matches = rec.get("matches") or (f"{frac.group(1)}/{frac.group(2)}" if frac else "")
+                pct = re.search(r"([\d.]+)\s*%", consistency)
+                pct = float(pct.group(1)) if pct else parse_number(consistency)
+                if frac and int(frac.group(2)):
+                    pct = round(int(frac.group(1)) / int(frac.group(2)) * 100, 1)
+                json_url = rec.get("report_url") or rec.get("json_url") or ""
+                report = REPORT_RE.search(json_url)
+                rows.append({"paipu": paipu, "rating": rating, "ai_consistency": pct, "matches": matches,
+                             "report_url": f"{MJAI}/killerducky/?data={report.group(0)}" if report else ""})
+        if not rows:
+            continue
+        append_history({
+            "time": time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime)),
+            "player": match.group("player"),
+            "player_id": player_id_from_paipu(rows[0]["paipu"]),
+            "room": OLD_ROOMS[match.group("room")],
+            "games": int(match.group("n")),
+            "source": f"{match.group('ver')} CSV",
+            "import_file": path.name,
+            "rows": rows,
+        })
+        imported += 1
+    print(f"[import] 导入 {imported} 个 CSV")
+
+
 # ---------------------------------------------------------------- main
-
-def write_csv(path, rows):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in CSV_FIELDS})
-        ok = [r for r in rows if r.get("status") in ("OK", "cache")]
-        if ok:
-            writer.writerow({
-                "index": "均值",
-                "rating": round(sum(r["rating"] for r in ok) / len(ok), 2),
-                "ai_consistency": round(sum(r["ai_consistency"] for r in ok) / len(ok), 2),
-                "status": f"{len(ok)}/{len(rows)} 局",
-            })
-
 
 def parse_args():
     ap = argparse.ArgumentParser(description=f"查rt工具 {VERSION}")
@@ -551,12 +687,22 @@ def parse_args():
     ap.add_argument("--refresh", action="store_true", help="忽略缓存，全部重新提交")
     ap.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL,
                     help=f"同时在 mjai 上处理几局，默认 {DEFAULT_PARALLEL}；遇到限流会自动减少")
+    ap.add_argument("--export", action="store_true", help="只重新生成 rt结果.xlsx，不查询")
+    ap.add_argument("--import-csv", metavar="文件夹", help="把旧版本的 CSV 导入总表，然后退出")
     return ap.parse_args()
 
 
 def main():
     started = time.time()
     args = parse_args()
+    if args.import_csv:
+        import_old_csv(args.import_csv)
+        export_excel()
+        return
+    if args.export:
+        export_excel()
+        return
+
     nickname = args.nickname or (None if args.player_id else input("昵称: ").strip())
     room = args.room or input("房间 (9=金之间, 12=玉之间, 16=王座之间): ").strip()
     games = args.games or int(input("最近几局: ").strip())
@@ -578,6 +724,7 @@ def main():
     driver = build_driver()
     print(f"[time] Chrome 启动 {time.time() - t0:.1f}s")
     rows = {}
+    paipus = []
     runner = None
     try:
         t0 = time.time()
@@ -586,8 +733,6 @@ def main():
         if not paipus:
             print("[error] 牌谱屋没有读到对局")
             return
-        safe_name = re.sub(r'[\\/:*?"<>|]+', "_", nickname)
-        out = OUTPUT_DIR / f"{safe_name}_{ROOM_NAMES.get(room, room)}_recent_{games}_{VERSION}.csv"
 
         jobs = []
         for idx, paipu in enumerate(paipus, 1):
@@ -607,9 +752,7 @@ def main():
             else:
                 rows[idx] = {"index": idx, "paipu": paipu, "status": f"ERROR: {error}"}
                 print(f"[#{idx}] 失败: {error}")
-            write_csv(out, [rows[i] for i in sorted(rows)])
 
-        write_csv(out, [rows[i] for i in sorted(rows)])
         if jobs:
             t0 = time.time()
             runner = MjaiRunner(driver, args.model, args.parallel)
@@ -620,14 +763,26 @@ def main():
             driver.quit()
         except Exception:
             pass
+        if rows:
+            # 中途中断也把已完成的局记下来
+            keep = ("paipu", "rating", "ai_consistency", "matches", "report_url", "status")
+            append_history({
+                "time": time.strftime("%Y-%m-%d %H:%M"),
+                "player": nickname,
+                "player_id": str(player_id),
+                "room": ROOM_NAMES.get(room, room),
+                "games": games,
+                "model": args.model,
+                "source": VERSION,
+                "rows": [{k: rows[i].get(k) for k in keep} for i in sorted(rows)],
+            })
+            export_excel()
 
-    rows = [rows[i] for i in sorted(rows)]
-    ok = [r for r in rows if r.get("status") in ("OK", "cache")]
-    print(f"\n[done] {out}")
+    ok = [rows[i] for i in sorted(rows) if rows[i].get("status") in ("OK", "cache")]
     if ok:
-        print(f"[done] rating 均值 {sum(r['rating'] for r in ok) / len(ok):.2f}，"
-              f"一致率均值 {sum(r['ai_consistency'] for r in ok) / len(ok):.2f}%，"
-              f"成功 {len(ok)}/{len(rows)}，缓存命中 {sum(r['status'] == 'cache' for r in rows)}")
+        print(f"[done] rating 均值 {mean([r['rating'] for r in ok])}，"
+              f"一致率均值 {mean([r['ai_consistency'] for r in ok])}%，"
+              f"成功 {len(ok)}/{len(rows)}，缓存命中 {sum(r['status'] == 'cache' for r in ok)}")
     if runner:
         print(f"[done] 并行 {args.parallel}，限流 {runner.rate_limited} 次，最后并行 {runner.limit}")
     print(f"[done] 用时 {time.time() - started:.0f}s")
