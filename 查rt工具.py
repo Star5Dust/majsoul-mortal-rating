@@ -750,9 +750,17 @@ def add_chart_sheets(wb, games, runs):
     trend["D1"], trend["E1"] = "rating均值", f"=IFERROR(INDEX('排行'!$E$2:$E${len(stats) + 1},MATCH($B$1,{rows_ref},0)),\"\")"
     trend["D2"], trend["E2"] = f"最近{TREND_WINDOW}局", f"=IFERROR(INDEX('排行'!$F$2:$F${len(stats) + 1},MATCH($B$1,{rows_ref},0)),\"\")"
     trend["D3"], trend["E3"] = "一致率均值%", f"=IFERROR(INDEX('排行'!$I$2:$I${len(stats) + 1},MATCH($B$1,{rows_ref},0)),\"\")"
+    # B4 填数字只看最近几局，留空看全部；E4 是实际显示的局数
+    trend["A4"], trend["C4"] = "显示最近 ▶", "局（留空=全部）"
+    trend["D4"], trend["E4"] = "实际显示", "=IF(AND(ISNUMBER($B$4),$B$4>0),MIN(INT($B$4),$B$3),$B$3)"
     trend["B1"].font = Font(bold=True, size=12, color="C00000")
-    for ref in ("A1", "A2", "A3", "D1", "D2", "D3"):
+    trend["B4"].font = Font(bold=True, size=12, color="C00000")
+    for ref in ("A1", "A2", "A3", "A4", "D1", "D2", "D3", "D4"):
         trend[ref].font = Font(bold=True)
+    shown = DataValidation(type="whole", operator="greaterThanOrEqual", formula1="0", allow_blank=True)
+    shown.error, shown.errorTitle = "填一个正整数，留空就是全部", "局数不对"
+    trend.add_data_validation(shown)
+    shown.add("B4")
     dv = DataValidation(type="list", formula1=f"={rows_ref}", allow_blank=False)
     dv.error, dv.errorTitle = "请从列表里选", "玩家不在列表里"
     trend.add_data_validation(dv)
@@ -765,10 +773,11 @@ def add_chart_sheets(wb, games, runs):
     last = header + capacity
     for i in range(1, capacity + 1):
         r = header + i
-        have = f"$B$3>={i}"
-        src = lambda col, k=i: f"INDEX('图表数据'!${col}:${col},$B$2+{k - 1})"
-        lo = max(0, i - TREND_WINDOW)
-        avg = lambda col, k=i, lo=lo: f"AVERAGE(INDEX('图表数据'!${col}:${col},$B$2+{lo}):{src(col, k)})"
+        # 只显示最近 $E$4 局：跳过前面 $B$3-$E$4 局；均线仍然往前取够 10 局
+        have = f"$E$4>={i}"
+        src = lambda col, k=i: f"INDEX('图表数据'!${col}:${col},$B$2+$B$3-$E$4+{k - 1})"
+        avg = lambda col, k=i: (f"AVERAGE(INDEX('图表数据'!${col}:${col},$B$2+MAX(0,$B$3-$E$4+{k - TREND_WINDOW})):"
+                                f"{src(col, k)})")
         trend.cell(row=r, column=1, value=f"=IF({have},{i},NA())")
         trend.cell(row=r, column=2, value=f"=IF({have},{src('C')},NA())")
         trend.cell(row=r, column=3, value=f"=IF({have},{src('D')},NA())")
