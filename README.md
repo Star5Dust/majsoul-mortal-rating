@@ -7,7 +7,7 @@
 1. 用牌谱屋接口按昵称搜玩家 ID（纯 HTTP，不开浏览器）
 2. 打开一个 Chrome，在牌谱屋玩家页读最近 N 局的牌谱 ID
 3. 查过的牌谱直接从本地缓存 `cache/reports.jsonl` 读，不再提交
-4. 没查过的在同一个 mjai.ekyu.moe 表单页里循环提交（Turnstile 通过后页内提交，不刷新页面）
+4. 没查过的在同一个 mjai.ekyu.moe 表单页里提交（Turnstile 通过后页内提交，不刷新页面），同时让几局一起在服务器上分析，进度用 HTTP 查询
 5. 直接下载报告 JSON 读 rating 和 AI 一致率，不打开 KillerDucky
 
 ## 快速开始
@@ -33,7 +33,7 @@ python 查rt工具.py --nickname "玩家昵称" --room 12 --games 20
 | `--games` | 查询最近 N 局 |
 | `--model` | Mortal 模型，默认 `4.1b`（和网页默认一致） |
 | `--refresh` | 忽略缓存，全部重新提交 |
-| `--min-interval` | 两次提交之间至少间隔几秒，遇到限流时可以调大 |
+| `--parallel` | 同时在 mjai 上处理几局，默认 2；遇到限流会自动减少并暂停 |
 
 ## 输出
 

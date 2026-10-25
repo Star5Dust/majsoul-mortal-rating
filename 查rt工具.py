@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter, deque
 from pathlib import Path
 
 import undetected_chromedriver as uc
@@ -43,6 +44,7 @@ UA = (
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 )
 REPORT_RE = re.compile(r"/report/[0-9a-f]+\.json")
+DEFAULT_PARALLEL = 2
 
 
 # ---------------------------------------------------------------- HTTP
@@ -248,8 +250,8 @@ const inp = f && f.querySelector('input[name="cf-turnstile-response"]');
 return inp ? inp.value : '';
 """
 
-JS_SUBMIT = """
-const [logUrl, model, timeoutSec, done] = arguments;
+JS_START_SUBMIT = """
+const [jobId, logUrl, model, timeoutSec] = arguments;
 const f = document.forms.reviewForm;
 const radio = f.querySelector('input[name="input-method"][value="log-url"]');
 if (radio) radio.checked = true;
@@ -257,15 +259,28 @@ f.elements['log-url'].value = logUrl;
 f.elements['mortal-model-tag'].value = model;
 f.elements['player-id'].value = '';
 f.elements['ui'].value = 'killerducky';
+const body = new URLSearchParams(new FormData(f));
+window.__rtJobs = window.__rtJobs || {};
+window.__rtJobs[jobId] = null;
 const ctl = new AbortController();
 setTimeout(() => ctl.abort(), timeoutSec * 1000);
-fetch(f.action, {method: 'POST', body: new URLSearchParams(new FormData(f)), signal: ctl.signal, credentials: 'same-origin'})
+fetch(f.action, {method: 'POST', body: body, signal: ctl.signal, credentials: 'same-origin'})
   .then(async r => {
     let text = '';
-    try { text = (await r.text()).slice(0, 4000); } catch (e) {}
-    done({status: r.status, url: r.url, text: text});
+    try { text = (await r.text()).slice(0, 3000); } catch (e) {}
+    window.__rtJobs[jobId] = {status: r.status, url: r.url, text: text};
   })
-  .catch(e => done({status: 0, url: '', text: String(e)}));
+  .catch(e => { window.__rtJobs[jobId] = {status: 0, url: '', text: String(e)}; });
+return true;
+"""
+
+JS_TAKE_FINISHED = """
+const jobs = window.__rtJobs || {};
+const out = {};
+for (const k of Object.keys(jobs)) {
+  if (jobs[k] !== null) { out[k] = jobs[k]; delete jobs[k]; }
+}
+return out;
 """
 
 JS_RESET = """
@@ -282,132 +297,204 @@ fetch(path, {credentials: 'same-origin'})
   .then(r => r.text()).then(t => done(t)).catch(e => done('ERROR ' + e));
 """
 
+TASK_RE = re.compile(r"/progress\?task=([0-9a-zA-Z]+)")
 
-class MjaiSession:
-    def __init__(self, driver, model, min_interval):
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_no_redirect_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def check_task(task_id):
+    """查一次排队页（不跟随跳转）。返回 ("done", 报告路径) / ("running", None) / ("limited", None)。"""
+    req = urllib.request.Request(f"{MJAI}/progress?task={task_id}", headers={"User-Agent": UA})
+    try:
+        with _no_redirect_opener.open(req, timeout=30) as resp:
+            status, location = resp.status, resp.headers.get("Location", "")
+    except urllib.error.HTTPError as exc:
+        status, location = exc.code, exc.headers.get("Location", "") if exc.headers else ""
+    if 300 <= status < 400:
+        match = REPORT_RE.search(urllib.parse.unquote(location))
+        if match:
+            return "done", match.group(0)
+        raise RuntimeError(f"排队页跳到了意外地址：{location}")
+    if status == 200:
+        return "running", None
+    if status == 429:
+        return "limited", None
+    raise RuntimeError(f"排队页返回 HTTP {status}")
+
+
+def fetch_report_http(path):
+    req = urllib.request.Request(MJAI + path, headers={"User-Agent": UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+class MjaiRunner:
+    """一个 mjai 表单页里并行处理多局。
+
+    同时最多 parallel 局在 mjai 上（提交中 + 服务器分析中）。每局只建一个分析任务：
+    POST 结果不确定（网络错误、超时）时宁可报错也不重提；只有确定没建成任务（限流、token 无效）才重试。
+    遇到限流就把并行数减 1，并暂停一会儿。
+    """
+
+    POLL_SECONDS = 1.5
+    TASK_TIMEOUT = 300
+
+    def __init__(self, driver, model, parallel):
         self.driver = driver
         self.model = model
-        self.min_interval = min_interval
+        self.limit = max(1, parallel)
+        self.form_ready = False
         self.last_token = None
-        self.last_submit = 0.0
-        self.on_form = False
-        self.progress_handle = None
+        self.token_wait_since = None
+        self.prompted = False
+        self.pause_until = 0.0
+        self.backoff = 30
+        self.rate_limited = 0
+        self.job_counter = 0
+
+    # ---- 表单页 / Turnstile
 
     def open_form(self):
         open_page(self.driver, MJAI_FORM)
         wait_until(self.driver, "return !!(document.forms.reviewForm)", "mjai 页面")
-        self.on_form = True
+        self.form_ready = True
         self.last_token = None
 
-    def wait_token(self):
-        js = JS_TOKEN
-        started = time.time()
-        prompted = False
-        while True:
-            token = self.driver.execute_script(js)
-            if token and token != self.last_token:
-                return token
-            if not prompted and time.time() - started > 20:
-                beep()
-                print("[wait] Turnstile 还没通过。如果浏览器里出现验证框，请手动点一下；程序会一直等。")
-                prompted = True
-            time.sleep(0.3)
+    def new_token(self):
+        """有新 token 就返回，否则返回 None（不阻塞）。"""
+        token = self.driver.execute_script(JS_TOKEN)
+        if token and token != self.last_token:
+            self.token_wait_since = None
+            self.prompted = False
+            return token
+        now = time.time()
+        if self.token_wait_since is None:
+            self.token_wait_since = now
+        elif not self.prompted and now - self.token_wait_since > 20:
+            beep()
+            print("[wait] Turnstile 还没通过。如果浏览器里出现验证框，请手动点一下；程序会一直等。")
+            self.prompted = True
+        return None
 
     def reset_token(self):
         result = self.driver.execute_script(JS_RESET)
         if result is not True:
-            print(f"  [turnstile] 重置失败（{result}），重新打开表单页")
-            self.open_form()
+            print(f"  [turnstile] 重置失败（{result}），等手上的提交完成后重新打开表单页")
+            self.form_ready = False
 
-    def submit(self, paipu):
-        """返回 /report/xxx.json 路径；失败抛出 RuntimeError。
-
-        一局只在服务器上建一个分析任务：拿到 /progress?task= 就等它完成，绝不重新提交。
-        只有确定任务没建成（限流、token 无效）时才重试提交。
-        """
-        log_url = f"https://game.maj-soul.com/1/?paipu={paipu}"
-        backoff = 30
-        for attempt in range(1, 4):
-            if not self.on_form:
-                self.open_form()
-            wait = self.min_interval - (time.time() - self.last_submit)
-            if wait > 0:
-                time.sleep(wait)
-            t0 = time.time()
-            self.last_token = self.wait_token()
-            t1 = time.time()
-            res = self.driver.execute_async_script(JS_SUBMIT, log_url, self.model, 180)
-            self.last_submit = time.time()
-            status, final_url, text = res.get("status"), res.get("url") or "", res.get("text") or ""
-            match = REPORT_RE.search(urllib.parse.unquote(final_url)) or REPORT_RE.search(text)
-            if match:
-                print(f"  token {t1 - t0:.1f}s, 分析 {time.time() - t1:.1f}s")
-                self.reset_token()
-                return match.group(0)
-            if "/progress" in final_url:
-                # 任务已经建好，在另一个标签页等它跑完；表单页同时重置 Turnstile 给下一局用
-                self.reset_token()
-                path = self.wait_progress(final_url)
-                print(f"  token {t1 - t0:.1f}s, 分析 {time.time() - t1:.1f}s")
-                return path
-            lowered = text.lower()
-            if status == 429 or "1015" in lowered or "rate limit" in lowered:
-                print(f"  [限流] HTTP {status}，等 {backoff}s 后重试 ({attempt}/3)")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 300)
-                self.reset_token()
-                continue
-            if status == 403 and "captcha" in lowered:
-                print(f"  [turnstile] token 无效，重新获取 ({attempt}/3)")
-                self.reset_token()
-                continue
-            snippet = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text))[:200]
-            self.reset_token()
-            raise RuntimeError(f"提交后返回了未知页面：HTTP {status} {final_url} {snippet}")
-        raise RuntimeError("提交 3 次都被限流或验证失败")
-
-    def wait_progress(self, progress_url, timeout=300):
-        """在第二个标签页打开排队页，等它跳转到报告。"""
-        form_handle = self.driver.current_window_handle
-        if self.progress_handle not in self.driver.window_handles:
-            self.driver.switch_to.new_window("tab")
-            self.progress_handle = self.driver.current_window_handle
-        else:
-            self.driver.switch_to.window(self.progress_handle)
-        try:
-            open_page(self.driver, progress_url)
-            started = time.time()
-            while time.time() - started < timeout:
-                try:
-                    url = urllib.parse.unquote(self.driver.current_url or "")
-                    match = REPORT_RE.search(url)
-                    if not match and "/progress" in url:
-                        match = REPORT_RE.search(self.driver.execute_script(
-                            "return document.documentElement.outerHTML.slice(0, 20000);") or "")
-                except WebDriverException:
-                    match, url = None, ""
-                if match:
-                    return match.group(0)
-                if url and "/progress" not in url and "/killerducky" not in url and "/report" not in url:
-                    raise RuntimeError(f"排队页跳到了意外地址：{url}")
-                time.sleep(1)
-            raise RuntimeError(f"等了 {timeout}s 分析还没完成：{progress_url}")
-        finally:
-            try:
-                open_page(self.driver, "about:blank")
-            except WebDriverException:
-                pass
-            self.driver.switch_to.window(form_handle)
+    def rate_limit_hit(self, why):
+        self.rate_limited += 1
+        old = self.limit
+        self.limit = max(1, self.limit - 1)
+        self.pause_until = time.time() + self.backoff
+        print(f"  [限流] {why}：并行 {old} -> {self.limit}，暂停 {self.backoff}s")
+        self.backoff = min(self.backoff * 2, 300)
 
     def fetch_report(self, path):
         try:
-            req = urllib.request.Request(MJAI + path, headers={"User-Agent": UA, "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+            return fetch_report_http(path)
         except (urllib.error.URLError, ValueError, OSError) as exc:
             print(f"  [report] 直接下载失败（{exc.__class__.__name__}），改用浏览器下载")
-        text = self.driver.execute_async_script(JS_FETCH_JSON, path)
-        return json.loads(text)
+        return json.loads(self.driver.execute_async_script(JS_FETCH_JSON, path))
+
+    # ---- 主循环
+
+    def run(self, jobs, on_done):
+        """jobs: [(idx, paipu)]；每局结束调用 on_done(idx, paipu, result 或 None, 错误信息)。"""
+        queue = deque(jobs)
+        attempts = Counter()
+        posting = {}  # job_id -> (idx, paipu, t_post)
+        tasks = {}  # task_id -> [idx, paipu, t_post, t_task, next_poll]
+
+        def finish(idx, paipu, path, t_post):
+            try:
+                result = parse_report(self.fetch_report(path))
+                result["report_url"] = f"{MJAI}/killerducky/?data={path}"
+                on_done(idx, paipu, result, None, time.time() - t_post)
+            except Exception as exc:
+                on_done(idx, paipu, None, f"读报告失败: {exc}", time.time() - t_post)
+
+        while queue or posting or tasks:
+            now = time.time()
+
+            # 1) 有空位就提交下一局
+            if queue and len(posting) + len(tasks) < self.limit and now >= self.pause_until:
+                if not self.form_ready:
+                    if not posting:
+                        self.open_form()
+                else:
+                    token = self.new_token()
+                    if token:
+                        idx, paipu = queue.popleft()
+                        attempts[paipu] += 1
+                        self.job_counter += 1
+                        job_id = str(self.job_counter)
+                        self.last_token = token
+                        self.driver.execute_script(
+                            JS_START_SUBMIT, job_id, f"https://game.maj-soul.com/1/?paipu={paipu}", self.model, 180
+                        )
+                        posting[job_id] = (idx, paipu, time.time())
+                        print(f"[#{idx}] 提交（同时进行 {len(posting) + len(tasks)}/{self.limit}）")
+                        self.reset_token()
+
+            # 2) 收提交结果
+            if posting:
+                for job_id, res in (self.driver.execute_script(JS_TAKE_FINISHED) or {}).items():
+                    idx, paipu, t_post = posting.pop(job_id)
+                    status, url, text = res.get("status"), res.get("url") or "", res.get("text") or ""
+                    lowered = text.lower()
+                    task = TASK_RE.search(url)
+                    report = REPORT_RE.search(urllib.parse.unquote(url))
+                    if report:
+                        finish(idx, paipu, report.group(0), t_post)
+                    elif task:
+                        tasks[task.group(1)] = [idx, paipu, t_post, time.time(), time.time() + self.POLL_SECONDS]
+                    elif status == 429 or "1015" in lowered or "rate limit" in lowered:
+                        self.rate_limit_hit(f"#{idx} 提交 HTTP {status}")
+                        if attempts[paipu] < 4:
+                            queue.appendleft((idx, paipu))
+                        else:
+                            on_done(idx, paipu, None, "多次被限流", time.time() - t_post)
+                    elif status == 403 and "captcha" in lowered:
+                        print(f"  [turnstile] #{idx} token 无效，重新排队")
+                        if attempts[paipu] < 4:
+                            queue.appendleft((idx, paipu))
+                        else:
+                            on_done(idx, paipu, None, "Turnstile 多次无效", time.time() - t_post)
+                    else:
+                        snippet = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text))[:200]
+                        on_done(idx, paipu, None, f"提交结果不明（不重提）：HTTP {status} {url} {snippet}",
+                                time.time() - t_post)
+
+            # 3) 查服务器分析进度（纯 HTTP，不开页面）
+            for task_id, item in list(tasks.items()):
+                idx, paipu, t_post, t_task, next_poll = item
+                if time.time() < next_poll:
+                    continue
+                try:
+                    state, path = check_task(task_id)
+                except Exception as exc:
+                    tasks.pop(task_id)
+                    on_done(idx, paipu, None, str(exc), time.time() - t_post)
+                    continue
+                if state == "done":
+                    tasks.pop(task_id)
+                    print(f"  [#{idx}] 提交 {t_task - t_post:.1f}s，分析 {time.time() - t_task:.1f}s")
+                    finish(idx, paipu, path, t_post)
+                elif time.time() - t_task > self.TASK_TIMEOUT:
+                    tasks.pop(task_id)
+                    on_done(idx, paipu, None, f"分析超过 {self.TASK_TIMEOUT}s 没完成（task={task_id}）",
+                            time.time() - t_post)
+                else:
+                    item[4] = time.time() + (10 if state == "limited" else self.POLL_SECONDS)
+
+            time.sleep(0.2)
 
 
 def parse_report(report):
@@ -451,7 +538,8 @@ def parse_args():
     ap.add_argument("--games", type=int, help="查最近 N 局")
     ap.add_argument("--model", default="4.1b", help="Mortal 模型，默认 4.1b（和网页默认一致）")
     ap.add_argument("--refresh", action="store_true", help="忽略缓存，全部重新提交")
-    ap.add_argument("--min-interval", type=float, default=0, help="两次提交之间至少间隔几秒，默认 0")
+    ap.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL,
+                    help=f"同时在 mjai 上处理几局，默认 {DEFAULT_PARALLEL}；遇到限流会自动减少")
     return ap.parse_args()
 
 
@@ -475,48 +563,62 @@ def main():
     print(f"[player] {nickname} id={player_id}")
 
     cache = ReportCache(CACHE_FILE)
+    t0 = time.time()
     driver = build_driver()
+    print(f"[time] Chrome 启动 {time.time() - t0:.1f}s")
+    rows = {}
+    runner = None
     try:
+        t0 = time.time()
         paipus = fetch_recent_paipu(driver, player_id, room, games)
+        print(f"[time] 牌谱屋列表 {time.time() - t0:.1f}s")
         if not paipus:
             print("[error] 牌谱屋没有读到对局")
             return
         safe_name = re.sub(r'[\\/:*?"<>|]+', "_", nickname)
         out = OUTPUT_DIR / f"{safe_name}_{ROOM_NAMES.get(room, room)}_recent_{games}_{VERSION}.csv"
 
-        mjai = MjaiSession(driver, args.model, args.min_interval)
-        rows = []
+        jobs = []
         for idx, paipu in enumerate(paipus, 1):
             hit = None if args.refresh else cache.get(paipu, args.model)
             if hit:
-                row = dict(hit, index=idx, status="cache")
-                print(f"[#{idx}] 缓存 rating={row['rating']} 一致率={row['ai_consistency']}%")
+                rows[idx] = dict(hit, index=idx, status="cache")
+                print(f"[#{idx}] 缓存 rating={hit['rating']} 一致率={hit['ai_consistency']}%")
             else:
-                print(f"[#{idx}] 提交 {paipu}")
-                try:
-                    path = mjai.submit(paipu)
-                    result = parse_report(mjai.fetch_report(path))
-                    result["report_url"] = f"{MJAI}/killerducky/?data={path}"
-                    cache.put(paipu, args.model, result)
-                    row = dict(result, index=idx, paipu=paipu, status="OK")
-                    print(f"[#{idx}] rating={row['rating']} 一致率={row['ai_consistency']}% ({row['matches']})")
-                except Exception as exc:
-                    row = {"index": idx, "paipu": paipu, "status": f"ERROR: {exc}"}
-                    print(f"[#{idx}] 失败: {exc}")
-            rows.append(row)
-            write_csv(out, rows)
+                jobs.append((idx, paipu))
+
+        def on_done(idx, paipu, result, error, elapsed):
+            if result:
+                cache.put(paipu, args.model, result)
+                rows[idx] = dict(result, index=idx, paipu=paipu, status="OK")
+                print(f"[#{idx}] rating={result['rating']} 一致率={result['ai_consistency']}% "
+                      f"({result['matches']})，用时 {elapsed:.1f}s")
+            else:
+                rows[idx] = {"index": idx, "paipu": paipu, "status": f"ERROR: {error}"}
+                print(f"[#{idx}] 失败: {error}")
+            write_csv(out, [rows[i] for i in sorted(rows)])
+
+        write_csv(out, [rows[i] for i in sorted(rows)])
+        if jobs:
+            t0 = time.time()
+            runner = MjaiRunner(driver, args.model, args.parallel)
+            runner.run(jobs, on_done)
+            print(f"[time] mjai {len(jobs)} 局 {time.time() - t0:.1f}s（平均 {(time.time() - t0) / len(jobs):.1f}s/局）")
     finally:
         try:
             driver.quit()
         except Exception:
             pass
 
+    rows = [rows[i] for i in sorted(rows)]
     ok = [r for r in rows if r.get("status") in ("OK", "cache")]
     print(f"\n[done] {out}")
     if ok:
         print(f"[done] rating 均值 {sum(r['rating'] for r in ok) / len(ok):.2f}，"
               f"一致率均值 {sum(r['ai_consistency'] for r in ok) / len(ok):.2f}%，"
               f"成功 {len(ok)}/{len(rows)}，缓存命中 {sum(r['status'] == 'cache' for r in rows)}")
+    if runner:
+        print(f"[done] 并行 {args.parallel}，限流 {runner.rate_limited} 次，最后并行 {runner.limit}")
     print(f"[done] 用时 {time.time() - started:.0f}s")
 
 
