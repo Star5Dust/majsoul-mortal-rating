@@ -552,6 +552,18 @@ def load_history():
     return runs
 
 
+def known_player(nickname=None, player_id=None):
+    """从查询记录里找 昵称 <-> 玩家ID，牌谱屋搜玩家被限流时也能用。"""
+    for run in reversed(load_history()):
+        if not run.get("player_id") or str(run.get("player")) == str(run.get("player_id")):
+            continue
+        if nickname and run.get("player") == nickname:
+            return run["player"], str(run["player_id"])
+        if player_id and str(run.get("player_id")) == str(player_id):
+            return run["player"], str(run["player_id"])
+    return None, None
+
+
 def game_date(paipu):
     """牌谱 ID 开头是 yymmdd。"""
     match = re.match(r"(\d{2})(\d{2})(\d{2})-", paipu or "")
@@ -573,6 +585,10 @@ def export_excel():
         return False
 
     runs = sorted(load_history(), key=lambda r: r.get("time", ""))
+    names = {str(r["player_id"]): r["player"] for r in runs
+             if r.get("player_id") and str(r.get("player")) != str(r["player_id"])}
+    for run in runs:  # 用 --player-id 查的记录补上昵称
+        run["player"] = names.get(str(run.get("player_id")), run.get("player"))
     games = {}
     for run in runs:
         for row in run.get("rows", []):
@@ -713,10 +729,14 @@ def main():
             player_id = search_player(nickname)
         except urllib.error.HTTPError as exc:
             print(f"[error] 牌谱屋搜玩家失败：HTTP {exc.code}（429 是限流，可以稍后再试）")
+        if not player_id:
+            player_id = known_player(nickname=nickname)[1]
+            if player_id:
+                print(f"[player] 用查询记录里的玩家 ID {player_id}")
     if not player_id:
         print("[error] 没找到玩家，可以用 --player-id 指定")
         return
-    nickname = nickname or player_id
+    nickname = nickname or known_player(player_id=player_id)[0] or str(player_id)
     print(f"[player] {nickname} id={player_id}")
 
     cache = ReportCache(CACHE_FILE)
