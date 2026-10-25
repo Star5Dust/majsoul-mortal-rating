@@ -647,8 +647,10 @@ RANK_MIN_GAMES = 10  # 排行图里至少要有几局
 
 
 def axis_bounds(values, step):
-    """图表纵轴范围：按全部数据取整，避免 Excel 自动从 0 开始。"""
-    return math.floor(min(values) / step) * step, math.ceil(max(values) / step) * step
+    """图表纵轴范围：避免 Excel 自动从 0 开始；下限取第 2 百分位，个别极低的局不把整张图压扁。"""
+    ordered = sorted(values)
+    low = ordered[int(len(ordered) * 0.02)]
+    return math.floor(low / step) * step, math.ceil(ordered[-1] / step) * step
 
 
 def add_chart_sheets(wb, games, runs):
@@ -722,6 +724,7 @@ def add_chart_sheets(wb, games, runs):
         chart = BarChart()
         chart.type = "bar"
         chart.title = f"{room} rating 均值（至少 {RANK_MIN_GAMES} 局）"
+        chart.title.overlay = False
         chart.legend = None
         chart.add_data(Reference(data, min_col=chart_col + 1, min_row=top, max_row=top + len(picked)), titles_from_data=True)
         chart.set_categories(Reference(data, min_col=chart_col, min_row=top + 1, max_row=top + len(picked)))
@@ -787,6 +790,7 @@ def add_chart_sheets(wb, games, runs):
     def line_chart(title, y_col, avg_col, values, step):
         chart = ScatterChart()
         chart.title = title
+        chart.title.overlay = False
         chart.style = 13
         xs = Reference(trend, min_col=1, min_row=header + 1, max_row=last)
         for col, as_points in ((y_col, True), (avg_col, False)):
@@ -809,7 +813,9 @@ def add_chart_sheets(wb, games, runs):
         chart.x_axis.title = "第几局（从早到晚）"
         chart.x_axis.delete = False
         chart.y_axis.delete = False
-        chart.legend.position = "b"
+        chart.x_axis.title.overlay = False
+        chart.legend.position = "t"
+        chart.legend.overlay = False
         chart.height, chart.width = 9, 22
         return chart
 
