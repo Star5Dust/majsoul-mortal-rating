@@ -12,6 +12,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import subprocess
@@ -630,6 +631,8 @@ def export_excel():
         for i, width in enumerate(widths[sheet.title]):
             sheet.column_dimensions[chr(ord("A") + i)].width = width
 
+    add_chart_sheets(wb, games, runs)
+
     try:
         wb.save(EXCEL_FILE)
     except PermissionError:
@@ -637,6 +640,186 @@ def export_excel():
         return False
     print(f"[excel] 已更新 {EXCEL_FILE}（{len(games)} 局，{len(runs)} 次查询）")
     return True
+
+
+TREND_WINDOW = 10  # 均线用最近几局
+RANK_MIN_GAMES = 10  # 排行图里至少要有几局
+
+
+def axis_bounds(values, step):
+    """图表纵轴范围：按全部数据取整，避免 Excel 自动从 0 开始。"""
+    return math.floor(min(values) / step) * step, math.ceil(max(values) / step) * step
+
+
+def add_chart_sheets(wb, games, runs):
+    """「趋势」页（下拉选玩家+房间，图跟着变）和「排行」页。只用 INDEX/MATCH，旧版 Excel 也能算。"""
+    from openpyxl.chart import BarChart, Reference, ScatterChart, Series
+    from openpyxl.chart.shapes import GraphicalProperties
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.styles import Font
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    if not games:
+        return
+    # 每个 玩家+房间 的对局按时间从早到晚排；同一天的按查询里的顺序（牌谱屋列表是新的在前）
+    groups = {}
+    for run, row in games.values():
+        pos = next(i for i, r in enumerate(run["rows"]) if r is row)
+        name = f"{run.get('player')} | {run.get('room')}"
+        groups.setdefault(name, []).append((game_date(row.get("paipu")), run.get("time", ""), -pos, row))
+    for items in groups.values():
+        items.sort(key=lambda item: item[:3])
+
+    # 隐藏的「图表数据」页：每组连续几行，趋势页用 起始行+局数 去取
+    data = wb.create_sheet("图表数据")
+    data.append(["玩家 | 房间", "第几局", "对局日期", "rating", "一致率%"])
+    stats = []
+    for name, items in groups.items():
+        start = data.max_row + 1
+        for i, (date, _, _, row) in enumerate(items, 1):
+            data.append([name, i, date, row["rating"], row.get("ai_consistency")])
+        ratings = [item[3]["rating"] for item in items]
+        cons = [item[3].get("ai_consistency") for item in items if isinstance(item[3].get("ai_consistency"), (int, float))]
+        player, room = name.rsplit(" | ", 1)
+        stats.append({"name": name, "player": player, "room": room, "n": len(items), "start": start,
+                      "rating": mean(ratings), "cons": mean(cons), "recent": mean(ratings[-TREND_WINDOW:]),
+                      "max": max(ratings), "min": min(ratings), "last": items[-1][0]})
+    data.sheet_state = "hidden"
+
+    # 「排行」：按房间分开，房间内按 rating 均值从高到低
+    room_order = {r: i for i, r in enumerate(ROOM_NAMES.values())}
+    stats.sort(key=lambda st: (room_order.get(st["room"], 9), st["room"], -(st["rating"] or 0)))
+    rank = wb.create_sheet("排行")
+    rank.append(["玩家 | 房间", "玩家", "房间", "局数", "rating均值", f"最近{TREND_WINDOW}局rating", "最高", "最低",
+                 "一致率均值%", "最近对局", "起始行"])
+    for st in stats:
+        rank.append([st["name"], st["player"], st["room"], st["n"], st["rating"], st["recent"], st["max"], st["min"],
+                     st["cons"], st["last"], st["start"]])
+    rank.column_dimensions["A"].hidden = True
+    rank.column_dimensions["K"].hidden = True
+    for col, width in zip("BCDEFGHIJ", [16, 9, 6, 10, 13, 8, 8, 11, 12]):
+        rank.column_dimensions[col].width = width
+    for cell in rank[1]:
+        cell.font = Font(bold=True)
+    rank.freeze_panes = "B2"
+    rank.auto_filter.ref = f"A1:K{rank.max_row}"
+
+    # 每个房间一张条形图，只放局数够的玩家；图的数据放在隐藏的「图表数据」页 G:H，排行页筛选排序不影响图
+    anchor_row = 1
+    data_row = 1
+    chart_col = 7
+    for room in sorted({st["room"] for st in stats}, key=lambda r: room_order.get(r, 9)):
+        picked = [st for st in stats if st["room"] == room and st["n"] >= RANK_MIN_GAMES][:30]
+        if len(picked) < 2:
+            continue
+        top = data_row
+        data.cell(row=top, column=chart_col, value=f"{room}（≥{RANK_MIN_GAMES}局）")
+        data.cell(row=top, column=chart_col + 1, value="rating均值")
+        for i, st in enumerate(reversed(picked), 1):  # 条形图从下往上画，倒过来让最高的在最上面
+            data.cell(row=top + i, column=chart_col, value=f"{st['player']}（{st['n']}局）")
+            data.cell(row=top + i, column=chart_col + 1, value=st["rating"])
+        data_row = top + len(picked) + 2
+        chart = BarChart()
+        chart.type = "bar"
+        chart.title = f"{room} rating 均值（至少 {RANK_MIN_GAMES} 局）"
+        chart.legend = None
+        chart.add_data(Reference(data, min_col=chart_col + 1, min_row=top, max_row=top + len(picked)), titles_from_data=True)
+        chart.set_categories(Reference(data, min_col=chart_col, min_row=top + 1, max_row=top + len(picked)))
+        low, high = axis_bounds([st["rating"] for st in picked], 5)
+        chart.y_axis.scaling.min, chart.y_axis.scaling.max = low, high
+        chart.x_axis.delete = False
+        chart.y_axis.delete = False
+        chart.height = max(6, 0.55 * len(picked) + 2)
+        chart.width = 16
+        rank.add_chart(chart, f"L{anchor_row}")
+        anchor_row += int(chart.height * 2) + 2
+
+    # 「趋势」：B1 下拉选，B2/B3 是起始行和局数，下面每行一局，超出局数的是 #N/A（图里不画，表里隐藏）
+    trend = wb.create_sheet("趋势", 0)
+    capacity = max(max(st["n"] for st in stats), 50)
+    latest = f"{runs[-1].get('player')} | {runs[-1].get('room')}" if runs else stats[0]["name"]
+    if latest not in groups:
+        latest = max(stats, key=lambda st: st["n"])["name"]
+    rows_ref = f"'排行'!$A$2:$A${len(stats) + 1}"
+    trend["A1"], trend["B1"] = "选择玩家 ▶", latest
+    trend["A2"], trend["B2"] = "起始行", f"=IFERROR(INDEX('排行'!$K$2:$K${len(stats) + 1},MATCH($B$1,{rows_ref},0)),0)"
+    trend["A3"], trend["B3"] = "局数", f"=IFERROR(INDEX('排行'!$D$2:$D${len(stats) + 1},MATCH($B$1,{rows_ref},0)),0)"
+    trend["D1"], trend["E1"] = "rating均值", f"=IFERROR(INDEX('排行'!$E$2:$E${len(stats) + 1},MATCH($B$1,{rows_ref},0)),\"\")"
+    trend["D2"], trend["E2"] = f"最近{TREND_WINDOW}局", f"=IFERROR(INDEX('排行'!$F$2:$F${len(stats) + 1},MATCH($B$1,{rows_ref},0)),\"\")"
+    trend["D3"], trend["E3"] = "一致率均值%", f"=IFERROR(INDEX('排行'!$I$2:$I${len(stats) + 1},MATCH($B$1,{rows_ref},0)),\"\")"
+    trend["B1"].font = Font(bold=True, size=12, color="C00000")
+    for ref in ("A1", "A2", "A3", "D1", "D2", "D3"):
+        trend[ref].font = Font(bold=True)
+    dv = DataValidation(type="list", formula1=f"={rows_ref}", allow_blank=False)
+    dv.error, dv.errorTitle = "请从列表里选", "玩家不在列表里"
+    trend.add_data_validation(dv)
+    dv.add("B1")
+
+    header = 5
+    titles = ["第几局", "对局日期", "rating", "一致率%", f"rating {TREND_WINDOW}局均线", f"一致率 {TREND_WINDOW}局均线"]
+    for col, title in enumerate(titles, 1):
+        trend.cell(row=header, column=col, value=title).font = Font(bold=True)
+    last = header + capacity
+    for i in range(1, capacity + 1):
+        r = header + i
+        have = f"$B$3>={i}"
+        src = lambda col, k=i: f"INDEX('图表数据'!${col}:${col},$B$2+{k - 1})"
+        lo = max(0, i - TREND_WINDOW)
+        avg = lambda col, k=i, lo=lo: f"AVERAGE(INDEX('图表数据'!${col}:${col},$B$2+{lo}):{src(col, k)})"
+        trend.cell(row=r, column=1, value=f"=IF({have},{i},NA())")
+        trend.cell(row=r, column=2, value=f"=IF({have},{src('C')},NA())")
+        trend.cell(row=r, column=3, value=f"=IF({have},{src('D')},NA())")
+        trend.cell(row=r, column=4, value=f"=IF({have},{src('E')},NA())")
+        trend.cell(row=r, column=5, value=f"=IF({have},ROUND({avg('D')},2),NA())")
+        trend.cell(row=r, column=6, value=f"=IF({have},ROUND({avg('E')},2),NA())")
+    # #N/A 用白字藏起来（图需要 #N/A 才会跳过这些点）
+    trend.conditional_formatting.add(f"A{header + 1}:F{last}",
+                                     FormulaRule(formula=[f"ISNA(A{header + 1})"], font=Font(color="FFFFFF")))
+    for col, width in zip("ABCDEF", [12, 12, 9, 9, 15, 15]):
+        trend.column_dimensions[col].width = width
+    trend.column_dimensions["B"].width = 22
+    trend.freeze_panes = f"A{header + 1}"
+    for sheet in (trend, rank):  # 打印时横向、宽度缩到一页
+        sheet.page_setup.orientation = "landscape"
+        sheet.sheet_properties.pageSetUpPr.fitToPage = True
+        sheet.page_setup.fitToWidth, sheet.page_setup.fitToHeight = 1, 0
+
+    def line_chart(title, y_col, avg_col, values, step):
+        chart = ScatterChart()
+        chart.title = title
+        chart.style = 13
+        xs = Reference(trend, min_col=1, min_row=header + 1, max_row=last)
+        for col, as_points in ((y_col, True), (avg_col, False)):
+            series = Series(Reference(trend, min_col=col, min_row=header, max_row=last), xs, title_from_data=True)
+            if as_points:
+                series.marker.symbol = "circle"
+                series.marker.size = 5
+                series.marker.graphicalProperties = GraphicalProperties(solidFill="4472C4")
+                series.marker.graphicalProperties.line.solidFill = "4472C4"
+                series.graphicalProperties.line.noFill = True
+            else:
+                series.marker.symbol = "none"
+                series.graphicalProperties.line.solidFill = "ED7D31"
+                series.graphicalProperties.line.width = 28000
+            series.smooth = False
+            chart.series.append(series)
+        low, high = axis_bounds(values, step)
+        chart.y_axis.scaling.min, chart.y_axis.scaling.max = low, high
+        chart.x_axis.scaling.min = 1
+        chart.x_axis.title = "第几局（从早到晚）"
+        chart.x_axis.delete = False
+        chart.y_axis.delete = False
+        chart.legend.position = "b"
+        chart.height, chart.width = 9, 22
+        return chart
+
+    all_ratings = [row["rating"] for _, row in games.values()]
+    all_cons = [row["ai_consistency"] for _, row in games.values() if isinstance(row.get("ai_consistency"), (int, float))]
+    trend.add_chart(line_chart("rating 走势（在 B1 换玩家）", 3, 5, all_ratings, 10), "H1")
+    if all_cons:
+        trend.add_chart(line_chart("AI 一致率走势 %", 4, 6, all_cons, 10), "H20")
+    wb.move_sheet(rank, offset=1 - wb.index(rank))
+    wb.active = 0
 
 
 OLD_CSV_RE = re.compile(r"^(?P<player>.+)_(?P<room>gold|jade|throne)_recent_(?P<n>\d+)_(?P<ver>v[\w.]+)\.csv$")
