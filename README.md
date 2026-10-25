@@ -1,12 +1,14 @@
-﻿# 查 RT 工具
+# 查 RT 工具
 
 自动查询雀魂玩家最近对局的 mortal 评分（rating）与 AI 一致率（ai_consistency），结果保存为 CSV。
 
-## 工作原理
+## 工作原理（v6）
 
-1. 在牌谱屋 [amae-koromo.sapk.ch](https://amae-koromo.sapk.ch) 搜索玩家，抓取指定房间最近 N 局的 MJAI 链接
-2. 把 MJAI 链接提交到 [mjai.ekyu.moe](https://mjai.ekyu.moe) 的 KillerDucky 分析页
-3. 读取 rating 和 AI 一致率，逐局写入 CSV checkpoint（中断可续跑）
+1. 用牌谱屋接口按昵称搜玩家 ID（纯 HTTP，不开浏览器）
+2. 打开一个 Chrome，在牌谱屋玩家页读最近 N 局的牌谱 ID
+3. 查过的牌谱直接从本地缓存 `cache/reports.jsonl` 读，不再提交
+4. 没查过的在同一个 mjai.ekyu.moe 表单页里循环提交（Turnstile 通过后页内提交，不刷新页面）
+5. 直接下载报告 JSON 读 rating 和 AI 一致率，不打开 KillerDucky
 
 ## 快速开始
 
@@ -14,10 +16,10 @@
 python 查rt工具.py
 ```
 
-未传参数时按提示输入昵称、房间（9=金之间，12=玉之间）、对局数。已知玩家 ID 可跳过搜索：
+未传参数时按提示输入昵称、房间（9=金之间，12=玉之间，16=王座之间）、对局数。也可以直接传参：
 
 ```powershell
-python 查rt工具.py --nickname "玩家昵称" --player-id 9139787 --room 12 --games 20 --workers 2
+python 查rt工具.py --nickname "玩家昵称" --room 12 --games 20
 ```
 
 依赖：`pip install selenium undetected-chromedriver`（需安装 Chrome）。
@@ -26,18 +28,16 @@ python 查rt工具.py --nickname "玩家昵称" --player-id 9139787 --room 12 --
 
 | 参数 | 说明 |
 | --- | --- |
-| `--nickname` / `--player-id` | 玩家昵称 / 玩家 ID |
-| `--room` | 9=金之间，12=玉之间 |
+| `--nickname` / `--player-id` | 玩家昵称 / 玩家 ID（填了 ID 就不搜昵称） |
+| `--room` | 9=金之间，12=玉之间，16=王座之间 |
 | `--games` | 查询最近 N 局 |
-| `--workers` | 并行 Chrome 数量，建议 2~3，默认 2 |
-| `--headless` | 无头模式，不建议（Cloudflare 下容易失败） |
-| `--reset-profile` | 重置 v5.1 Chrome profile |
-| `--rate-limit-retries` | 遇到 Error 1015 限流时自动重试次数 |
-| `--worker-stall-restart-seconds` | worker 卡住多少秒后重开浏览器，默认 15 |
+| `--model` | Mortal 模型，默认 `4.1b`（和网页默认一致） |
+| `--refresh` | 忽略缓存，全部重新提交 |
+| `--min-interval` | 两次提交之间至少间隔几秒，遇到限流时可以调大 |
 
 ## 输出
 
-CSV 保存到 `outputs_all/{昵称}_{房间}_recent_{N}_v5.1.csv`，字段：`index`、`mjai_url`、`json_url`、`rating`、`ai_consistency`、`status`，末尾附带均值统计。
+CSV 保存到 `outputs_all/{昵称}_{房间}_recent_{N}_v6.csv`，一局一行：`index`、`rating`、`ai_consistency`（%）、`matches`（一致步数/总步数）、`paipu`、`report_url`、`status`（OK / cache / ERROR），最后一行是均值。
 
 ## 版本迭代
 
@@ -57,11 +57,11 @@ git checkout main            # 回到最新版
 | `v3` | 多 worker 并行，速度大幅提升 |
 | `v4` / `v4.1` | 去掉冷却延迟，异常自动重启浏览器 |
 | `v5` | 自动处理 Cloudflare 1015 限流重试 |
-| `v5.1` | **当前最新版**，1015 自动重试、worker 卡死重开、独立 profile、多窗口自动布局、Chrome 启动失败重试 |
+| `v5.1` | 1015 自动重试、worker 卡死重开、独立 profile、多窗口自动布局、Chrome 启动失败重试 |
 | `v5.1-test` | v5.1 的测试分支：Cloudflare 手动验证等待延长到 600 秒，单 worker |
+| `v6` | **当前最新版**，单 Chrome + 接口读报告 + 按牌谱 ID 全局缓存 |
 
 ## 注意事项
 
-- 请保持 Chrome 窗口可见，Cloudflare 验证需手动完成
-- 不要开太多 worker，避免触发限流
-- 途中断开也没关系，已完成的局会保留在 CSV 中
+- 请保持 Chrome 窗口可见。如果出现人机验证，程序会响一声提示，手动点一下即可，程序会一直等
+- 中途断开也没关系，查过的局都在缓存里，重跑会直接跳过
