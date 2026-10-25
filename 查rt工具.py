@@ -44,7 +44,7 @@ UA = (
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 )
 REPORT_RE = re.compile(r"/report/[0-9a-f]+\.json")
-DEFAULT_PARALLEL = 2
+DEFAULT_PARALLEL = 1
 
 
 # ---------------------------------------------------------------- HTTP
@@ -268,7 +268,7 @@ fetch(f.action, {method: 'POST', body: body, signal: ctl.signal, credentials: 's
   .then(async r => {
     let text = '';
     try { text = (await r.text()).slice(0, 3000); } catch (e) {}
-    window.__rtJobs[jobId] = {status: r.status, url: r.url, text: text};
+    window.__rtJobs[jobId] = {status: r.status, url: r.url, text: text, retry: r.headers.get('retry-after')};
   })
   .catch(e => { window.__rtJobs[jobId] = {status: 0, url: '', text: String(e)}; });
 return true;
@@ -339,8 +339,11 @@ class MjaiRunner:
 
     同时最多 parallel 局在 mjai 上（提交中 + 服务器分析中）。每局只建一个分析任务：
     POST 结果不确定（网络错误、超时）时宁可报错也不重提；只有确定没建成任务（限流、token 无效）才重试。
-    遇到限流就把并行数减 1，并暂停一会儿。
+    遇到限流就把并行数减 1，按 Retry-After 暂停；没有 Retry-After 就 3s、8s、20s、60s 逐步加长，
+    下一次提交用新的 Turnstile token（不刷新整页）。
     """
+
+    RATE_LIMIT_WAITS = (3, 8, 20, 60)
 
     POLL_SECONDS = 1.5
     TASK_TIMEOUT = 300
@@ -354,7 +357,7 @@ class MjaiRunner:
         self.token_wait_since = None
         self.prompted = False
         self.pause_until = 0.0
-        self.backoff = 30
+        self.limited_in_row = 0
         self.rate_limited = 0
         self.job_counter = 0
 
@@ -388,13 +391,19 @@ class MjaiRunner:
             print(f"  [turnstile] 重置失败（{result}），等手上的提交完成后重新打开表单页")
             self.form_ready = False
 
-    def rate_limit_hit(self, why):
+    def rate_limit_hit(self, why, retry_after=None):
         self.rate_limited += 1
         old = self.limit
         self.limit = max(1, self.limit - 1)
-        self.pause_until = time.time() + self.backoff
-        print(f"  [限流] {why}：并行 {old} -> {self.limit}，暂停 {self.backoff}s")
-        self.backoff = min(self.backoff * 2, 300)
+        try:
+            wait = min(max(float(retry_after), 1), 120)
+            source = "Retry-After"
+        except (TypeError, ValueError):
+            wait = self.RATE_LIMIT_WAITS[min(self.limited_in_row, len(self.RATE_LIMIT_WAITS) - 1)]
+            source = f"第 {self.limited_in_row + 1} 次连续限流"
+        self.limited_in_row += 1
+        self.pause_until = time.time() + wait
+        print(f"  [限流] {why}：并行 {old} -> {self.limit}，暂停 {wait:.0f}s（{source}）")
 
     def fetch_report(self, path):
         try:
@@ -451,12 +460,14 @@ class MjaiRunner:
                     lowered = text.lower()
                     task = TASK_RE.search(url)
                     report = REPORT_RE.search(urllib.parse.unquote(url))
+                    if report or task:
+                        self.limited_in_row = 0
                     if report:
                         finish(idx, paipu, report.group(0), t_post)
                     elif task:
                         tasks[task.group(1)] = [idx, paipu, t_post, time.time(), time.time() + self.POLL_SECONDS]
                     elif status == 429 or "1015" in lowered or "rate limit" in lowered:
-                        self.rate_limit_hit(f"#{idx} 提交 HTTP {status}")
+                        self.rate_limit_hit(f"#{idx} 提交 HTTP {status}", res.get("retry"))
                         if attempts[paipu] < 4:
                             queue.appendleft((idx, paipu))
                         else:

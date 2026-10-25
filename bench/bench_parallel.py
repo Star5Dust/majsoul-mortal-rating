@@ -16,9 +16,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = Path(__file__).resolve().parent / "bench_result.txt"
-ARGS = ["--nickname", "心转手大铲车", "--player-id", "23260736", "--room", "12", "--games", "8", "--refresh"]
-LEVELS = [1, 2, 3, 4]
-COOLDOWN = 90
+ARGS = ["--nickname", "心转手大铲车", "--player-id", "23260736", "--room", "12", "--games", "6", "--refresh"]
+LEVELS = [1, 2]
+COOLDOWN = 60
 
 
 def main():

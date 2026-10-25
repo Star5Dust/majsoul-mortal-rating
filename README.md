@@ -33,7 +33,7 @@ python 查rt工具.py --nickname "玩家昵称" --room 12 --games 20
 | `--games` | 查询最近 N 局 |
 | `--model` | Mortal 模型，默认 `4.1b`（和网页默认一致） |
 | `--refresh` | 忽略缓存，全部重新提交 |
-| `--parallel` | 同时在 mjai 上处理几局，默认 2；遇到限流会自动减少并暂停 |
+| `--parallel` | 同时在 mjai 上处理几局，默认 1；遇到限流会自动减少，并按 Retry-After 或 3/8/20/60 秒短暂停后用新 token 重提 |
 
 ## 输出
 
