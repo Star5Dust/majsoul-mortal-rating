@@ -6,6 +6,7 @@ cf_debug/
 
 # 运行输出
 outputs_all/
+cache/
 outputs_v*/
 reports/
 *.tmp
@@ -22,4 +23,5 @@ cf_autoclick.py
 diag_click.py
 extract_cookies.py
 probe_*.py
+v6_probe/
 v6_*.py
