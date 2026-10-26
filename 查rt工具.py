@@ -777,7 +777,7 @@ def add_chart_sheets(wb, games, runs):
     put("B1", latest, bold=True, size=12, color="000000", fill=input_fill, border=True)
     trend.merge_cells("B1:D1")
     put("A2", "显示最近 ▶", bold=True, align=left)
-    put("B2", None, bold=True, size=12, color="C00000", fill=input_fill, border=True)
+    put("B2", None, bold=True, size=12, color="000000", fill=input_fill, border=True)
     put("C2", "局（留空 = 全部）", size=9, color="808080", align=left)
     put("Z1", "起始行")
     put("Z2", lookup("K", 0))
