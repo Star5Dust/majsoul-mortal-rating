@@ -774,7 +774,7 @@ def add_chart_sheets(wb, games, runs):
 
     left = Alignment(horizontal="left", vertical="center")
     put("A1", "选择玩家 ▶", bold=True, align=left)
-    put("B1", latest, bold=True, size=12, color="C00000", fill=input_fill, border=True)
+    put("B1", latest, bold=True, size=12, color="000000", fill=input_fill, border=True)
     trend.merge_cells("B1:D1")
     put("A2", "显示最近 ▶", bold=True, align=left)
     put("B2", None, bold=True, size=12, color="C00000", fill=input_fill, border=True)
@@ -791,7 +791,7 @@ def add_chart_sheets(wb, games, runs):
     for r, (label, all_value, recent_value, fmt) in enumerate(stat_rows, 5):
         put(f"A{r}", label, bold=True, fill=PatternFill("solid", fgColor="F2F2F2"), border=True, align=left)
         put(f"B{r}", all_value, fmt=fmt, border=True)
-        put(f"C{r}", recent_value, bold=True, color="C00000", fmt=fmt, border=True)
+        put(f"C{r}", recent_value, bold=True, color="0070C0", fmt=fmt, border=True)
 
     only_n = DataValidation(type="whole", operator="greaterThanOrEqual", formula1="0", allow_blank=True)
     only_n.error, only_n.errorTitle = "填一个正整数，留空就是全部", "局数不对"
