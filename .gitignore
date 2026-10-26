@@ -4,10 +4,15 @@ test_chrome_profile/
 cf_debug/
 *cookies*.json
 
-# 运行输出
+# 运行数据（浏览器配置、缓存、查询历史）和结果表
+data/
+rt结果*.xlsx
+~$*.xlsx
+
+# 旧版本输出和归档
+old/
 outputs_all/
 cache/
-bench/bench_result.txt
 outputs_v*/
 reports/
 *.tmp

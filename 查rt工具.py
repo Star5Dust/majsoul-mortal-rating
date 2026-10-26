@@ -12,6 +12,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import subprocess
@@ -27,18 +28,19 @@ import undetected_chromedriver as uc
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
 
-VERSION = "v6"
+VERSION = "v6.2"
 BASE_DIR = Path(__file__).resolve().parent
-PROFILE_DIR = BASE_DIR / "chrome_user_data_v6"
-OUTPUT_DIR = BASE_DIR / "outputs_all"
-CACHE_FILE = BASE_DIR / "cache" / "reports.jsonl"
+DATA_DIR = BASE_DIR / "data"
+PROFILE_DIR = DATA_DIR / "chrome_profile"
+CACHE_FILE = DATA_DIR / "reports.jsonl"  # 按 牌谱ID+模型 缓存的分析结果
+HISTORY_FILE = DATA_DIR / "history.jsonl"  # 每次查询一行，rt结果.xlsx 由它生成
+EXCEL_FILE = BASE_DIR / "rt结果.xlsx"
 
 AMAE_SITE = "https://amae-koromo.sapk.ch"
 AMAE_API = "https://5-data.amae-koromo.com/api/v2/pl4"
 MJAI = "https://mjai.ekyu.moe"
 MJAI_FORM = f"{MJAI}/zh-cn.html"
-ROOM_NAMES = {"9": "gold", "12": "jade", "16": "throne"}
-CSV_FIELDS = ["index", "rating", "ai_consistency", "matches", "paipu", "report_url", "status"]
+ROOM_NAMES = {"9": "金之间", "12": "玉之间", "16": "王座之间"}
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -72,6 +74,15 @@ def search_player(nickname):
 def encode_account_id(player_id):
     """牌谱链接末尾 _a 后面的视角编码。"""
     return ((7 * int(player_id) + 1117113) ^ 86216345) + 1358437
+
+
+def player_id_from_paipu(paipu):
+    """encode_account_id 的反运算：从 ..._a217758789 里取回玩家 ID。"""
+    match = re.search(r"_a(\d+)$", paipu or "")
+    if not match:
+        return None
+    value = ((int(match.group(1)) - 1358437) ^ 86216345) - 1117113
+    return str(value // 7) if value > 0 and value % 7 == 0 else None
 
 
 # ---------------------------------------------------------------- cache
@@ -522,24 +533,402 @@ def parse_report(report):
     }
 
 
+# ---------------------------------------------------------------- 历史记录 / Excel
+
+def append_history(record):
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with HISTORY_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def load_history():
+    if not HISTORY_FILE.exists():
+        return []
+    runs = []
+    for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
+        try:
+            runs.append(json.loads(line))
+        except ValueError:
+            continue
+    return runs
+
+
+def known_player(nickname=None, player_id=None):
+    """从查询记录里找 昵称 <-> 玩家ID，牌谱屋搜玩家被限流时也能用。"""
+    for run in reversed(load_history()):
+        if not run.get("player_id") or str(run.get("player")) == str(run.get("player_id")):
+            continue
+        if nickname and run.get("player") == nickname:
+            return run["player"], str(run["player_id"])
+        if player_id and str(run.get("player_id")) == str(player_id):
+            return run["player"], str(run["player_id"])
+    return None, None
+
+
+def game_date(paipu):
+    """牌谱 ID 开头是 yymmdd。"""
+    match = re.match(r"(\d{2})(\d{2})(\d{2})-", paipu or "")
+    return f"20{match.group(1)}-{match.group(2)}-{match.group(3)}" if match else ""
+
+
+def mean(values):
+    values = [v for v in values if isinstance(v, (int, float))]
+    return round(sum(values) / len(values), 2) if values else None
+
+
+def export_excel():
+    """用 data/history.jsonl 重新生成 rt结果.xlsx。返回是否成功。"""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError:
+        print("[excel] 没装 openpyxl，跳过 Excel（pip install openpyxl）")
+        return False
+
+    runs = sorted(load_history(), key=lambda r: r.get("time", ""))
+    names = {str(r["player_id"]): r["player"] for r in runs
+             if r.get("player_id") and str(r.get("player")) != str(r["player_id"])}
+    for run in runs:  # 用 --player-id 查的记录补上昵称
+        run["player"] = names.get(str(run.get("player_id")), run.get("player"))
+    games = {}
+    for run in runs:
+        for row in run.get("rows", []):
+            if not isinstance(row.get("rating"), (int, float)):
+                continue
+            key = (run.get("player_id") or run.get("player"), run.get("room"), row.get("paipu"))
+            games[key] = (run, row)  # 后面的查询覆盖前面的
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "对局"
+    ws.append(["玩家", "房间", "对局日期", "rating", "一致率%", "一致步数", "牌谱ID", "报告链接", "查询时间", "来源"])
+    ordered = sorted(games.values(), key=lambda item: (item[0].get("player", ""), item[0].get("room", ""),
+                                                       game_date(item[1].get("paipu"))), reverse=True)
+    ordered.sort(key=lambda item: (item[0].get("player", ""), item[0].get("room", "")))
+    for run, row in ordered:
+        ws.append([run.get("player"), run.get("room"), game_date(row.get("paipu")), row.get("rating"),
+                   row.get("ai_consistency"), row.get("matches"), row.get("paipu"), row.get("report_url") or "",
+                   run.get("time"), run.get("source")])
+        url = row.get("report_url")
+        if url:
+            cell = ws.cell(row=ws.max_row, column=8)
+            cell.hyperlink = url
+            cell.font = Font(color="0563C1", underline="single")
+
+    ws2 = wb.create_sheet("查询记录")
+    ws2.append(["查询时间", "玩家", "房间", "局数", "成功", "rating均值", "一致率均值%", "来源"])
+    for run in reversed(runs):
+        ok = [r for r in run.get("rows", []) if isinstance(r.get("rating"), (int, float))]
+        ws2.append([run.get("time"), run.get("player"), run.get("room"), run.get("games"), len(ok),
+                    mean([r["rating"] for r in ok]), mean([r.get("ai_consistency") for r in ok]), run.get("source")])
+
+    widths = {"对局": [16, 9, 12, 8, 9, 10, 50, 60, 18, 12], "查询记录": [18, 16, 9, 6, 6, 11, 12, 12]}
+    for sheet in (ws, ws2):
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for i, width in enumerate(widths[sheet.title]):
+            sheet.column_dimensions[chr(ord("A") + i)].width = width
+
+    add_chart_sheets(wb, games, runs)
+
+    try:
+        wb.save(EXCEL_FILE)
+    except PermissionError:
+        print(f"[excel] {EXCEL_FILE.name} 正在被 Excel 打开，没法更新。关掉后运行：python 查rt工具.py --export")
+        return False
+    print(f"[excel] 已更新 {EXCEL_FILE}（{len(games)} 局，{len(runs)} 次查询）")
+    return True
+
+
+TREND_WINDOW = 10  # 均线用最近几局
+RANK_MIN_GAMES = 10  # 排行图里至少要有几局
+
+
+def axis_bounds(values, step):
+    """图表纵轴范围：避免 Excel 自动从 0 开始；下限取第 2 百分位，个别极低的局不把整张图压扁。"""
+    ordered = sorted(values)
+    low = ordered[int(len(ordered) * 0.02)]
+    return math.floor(low / step) * step, math.ceil(ordered[-1] / step) * step
+
+
+def add_chart_sheets(wb, games, runs):
+    """「趋势」页（下拉选玩家+房间，图跟着变）和「排行」页。只用 INDEX/MATCH，旧版 Excel 也能算。"""
+    from openpyxl.chart import BarChart, Reference, ScatterChart, Series
+    from openpyxl.chart.shapes import GraphicalProperties
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    if not games:
+        return
+    # 每个 玩家+房间 的对局按时间从早到晚排；同一天的按查询里的顺序（牌谱屋列表是新的在前）
+    groups = {}
+    for run, row in games.values():
+        pos = next(i for i, r in enumerate(run["rows"]) if r is row)
+        name = f"{run.get('player')} | {run.get('room')}"
+        groups.setdefault(name, []).append((game_date(row.get("paipu")), run.get("time", ""), -pos, row))
+    for items in groups.values():
+        items.sort(key=lambda item: item[:3])
+
+    # 隐藏的「图表数据」页：每组连续几行，趋势页用 起始行+局数 去取
+    data = wb.create_sheet("图表数据")
+    data.append(["玩家 | 房间", "第几局", "对局日期", "rating", "一致率%"])
+    stats = []
+    for name, items in groups.items():
+        start = data.max_row + 1
+        for i, (date, _, _, row) in enumerate(items, 1):
+            data.append([name, i, date, row["rating"], row.get("ai_consistency")])
+        ratings = [item[3]["rating"] for item in items]
+        cons = [item[3].get("ai_consistency") for item in items if isinstance(item[3].get("ai_consistency"), (int, float))]
+        player, room = name.rsplit(" | ", 1)
+        stats.append({"name": name, "player": player, "room": room, "n": len(items), "start": start,
+                      "rating": mean(ratings), "cons": mean(cons), "recent": mean(ratings[-TREND_WINDOW:]),
+                      "max": max(ratings), "min": min(ratings), "last": items[-1][0]})
+    data.sheet_state = "hidden"
+
+    # 「排行」：按房间分开，房间内按 rating 均值从高到低
+    room_order = {r: i for i, r in enumerate(ROOM_NAMES.values())}
+    stats.sort(key=lambda st: (room_order.get(st["room"], 9), st["room"], -(st["rating"] or 0)))
+    rank = wb.create_sheet("排行")
+    rank.append(["玩家 | 房间", "玩家", "房间", "局数", "rating均值", f"最近{TREND_WINDOW}局rating", "最高", "最低",
+                 "一致率均值%", "最近对局", "起始行"])
+    for st in stats:
+        rank.append([st["name"], st["player"], st["room"], st["n"], st["rating"], st["recent"], st["max"], st["min"],
+                     st["cons"], st["last"], st["start"]])
+    rank.column_dimensions["A"].hidden = True
+    rank.column_dimensions["K"].hidden = True
+    for col, width in zip("BCDEFGHIJ", [16, 9, 6, 10, 13, 8, 8, 11, 12]):
+        rank.column_dimensions[col].width = width
+    for cell in rank[1]:
+        cell.font = Font(bold=True)
+    rank.freeze_panes = "B2"
+    rank.auto_filter.ref = f"A1:K{rank.max_row}"
+
+    # 每个房间一张条形图，只放局数够的玩家；图的数据放在隐藏的「图表数据」页 G:H，排行页筛选排序不影响图
+    anchor_row = 1
+    data_row = 1
+    chart_col = 7
+    for room in sorted({st["room"] for st in stats}, key=lambda r: room_order.get(r, 9)):
+        picked = [st for st in stats if st["room"] == room and st["n"] >= RANK_MIN_GAMES]
+        if len(picked) < 2:
+            continue
+        top = data_row
+        data.cell(row=top, column=chart_col, value=f"{room}（≥{RANK_MIN_GAMES}局）")
+        data.cell(row=top, column=chart_col + 1, value="rating均值")
+        for i, st in enumerate(reversed(picked), 1):  # 条形图从下往上画，倒过来让最高的在最上面
+            data.cell(row=top + i, column=chart_col, value=f"{st['player']}（{st['n']}局）")
+            data.cell(row=top + i, column=chart_col + 1, value=st["rating"])
+        data_row = top + len(picked) + 2
+        chart = BarChart()
+        chart.type = "bar"
+        chart.title = f"{room} rating 均值（至少 {RANK_MIN_GAMES} 局）"
+        chart.title.overlay = False
+        chart.legend = None
+        chart.add_data(Reference(data, min_col=chart_col + 1, min_row=top, max_row=top + len(picked)), titles_from_data=True)
+        chart.set_categories(Reference(data, min_col=chart_col, min_row=top + 1, max_row=top + len(picked)))
+        low, high = axis_bounds([st["rating"] for st in picked], 5)
+        chart.y_axis.scaling.min, chart.y_axis.scaling.max = low, high
+        chart.x_axis.delete = False
+        chart.y_axis.delete = False
+        chart.height = max(6, 0.55 * len(picked) + 2)
+        chart.width = 16
+        rank.add_chart(chart, f"L{anchor_row}")
+        anchor_row += int(chart.height * 2) + 2
+
+    # 「趋势」：上面是输入区（B1 选玩家、B2 填最近几局）和统计表（全部 | 最近 N 局），空一行后每行一局；
+    # 超出显示局数的行是 #N/A（图里不画，表里白字藏起来）。起始行放在隐藏的 Z 列。
+    trend = wb.create_sheet("趋势", 0)
+    capacity = max(max(st["n"] for st in stats), 50)
+    latest = f"{runs[-1].get('player')} | {runs[-1].get('room')}" if runs else stats[0]["name"]
+    if latest not in groups:
+        latest = max(stats, key=lambda st: st["n"])["name"]
+    rows_ref = f"'排行'!$A$2:$A${len(stats) + 1}"
+    lookup = lambda col, default: (f"=IFERROR(INDEX('排行'!${col}$2:${col}${len(stats) + 1},"
+                                   f"MATCH($B$1,{rows_ref},0)),{default})")
+    pick, start, total, shown = "$B$2", "$Z$2", "$B$5", "$C$5"
+    # 全部和最近 N 局都用同一个 Excel 公式算，四舍五入一致（Python 的 round 对 .xx5 会和 Excel 差 0.01）
+    recent = lambda col, n: (f"=IF({n}>0,ROUND(AVERAGE(INDEX('图表数据'!${col}:${col},{start}+{total}-{n}):"
+                             f"INDEX('图表数据'!${col}:${col},{start}+{total}-1)),2),\"\")")
+
+    yahei = "微软雅黑"
+    thin = Side(style="thin", color="BFBFBF")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    head_fill = PatternFill("solid", fgColor="DDEBF7")
+    input_fill = PatternFill("solid", fgColor="FFF2CC")
+    center = Alignment(horizontal="center", vertical="center")
+
+    def put(ref, value, bold=False, size=10, color=None, fill=None, fmt=None, border=False, align=center):
+        cell = trend[ref]
+        cell.value = value
+        cell.font = Font(name=yahei, bold=bold, size=size, color=color)
+        cell.alignment = align
+        if fill:
+            cell.fill = fill
+        if fmt:
+            cell.number_format = fmt
+        if border:
+            cell.border = box
+        return cell
+
+    left = Alignment(horizontal="left", vertical="center")
+    put("A1", "选择玩家 ▶", bold=True, align=left)
+    put("B1", latest, bold=True, size=12, color="000000", fill=input_fill, border=True)
+    trend.merge_cells("B1:D1")
+    put("A2", "显示最近 ▶", bold=True, align=left)
+    put("B2", None, bold=True, size=12, color="000000", fill=input_fill, border=True)
+    put("C2", "局（留空 = 全部）", size=9, color="808080", align=left)
+    put("Z1", "起始行")
+    put("Z2", lookup("K", 0))
+
+    put("A4", "", fill=head_fill, border=True)
+    put("B4", "全部", bold=True, fill=head_fill, border=True)
+    put("C4", f'="最近 "&{shown}&" 局"', bold=True, fill=head_fill, border=True)
+    stat_rows = [("局数", lookup("D", 0), f"=IF(AND(ISNUMBER({pick}),{pick}>0),MIN(INT({pick}),{total}),{total})", "0"),
+                 ("rating 均值", recent("D", total), recent("D", shown), "0.00"),
+                 ("一致率均值 %", recent("E", total), recent("E", shown), "0.00")]
+    for r, (label, all_value, recent_value, fmt) in enumerate(stat_rows, 5):
+        put(f"A{r}", label, bold=True, fill=PatternFill("solid", fgColor="F2F2F2"), border=True, align=left)
+        put(f"B{r}", all_value, fmt=fmt, border=True)
+        put(f"C{r}", recent_value, bold=True, color="0070C0", fmt=fmt, border=True)
+
+    only_n = DataValidation(type="whole", operator="greaterThanOrEqual", formula1="0", allow_blank=True)
+    only_n.error, only_n.errorTitle = "填一个正整数，留空就是全部", "局数不对"
+    trend.add_data_validation(only_n)
+    only_n.add("B2")
+    dv = DataValidation(type="list", formula1=f"={rows_ref}", allow_blank=False)
+    dv.error, dv.errorTitle = "请从列表里选", "玩家不在列表里"
+    trend.add_data_validation(dv)
+    dv.add("B1")
+
+    header = 9
+    titles = ["第几局", "对局日期", "rating", "一致率 %", f"rating {TREND_WINDOW}局均线", f"一致率 {TREND_WINDOW}局均线"]
+    for col, title in enumerate(titles, 1):
+        put(f"{'ABCDEF'[col - 1]}{header}", title, bold=True, fill=head_fill, border=True)
+    last = header + capacity
+    formats = [None, None, "0.0", "0.0", "0.00", "0.00"]
+    for i in range(1, capacity + 1):
+        r = header + i
+        # 只显示最近 shown 局：跳过前面 total-shown 局；均线仍然往前取够 10 局
+        have = f"{shown}>={i}"
+        src = lambda col, k=i: f"INDEX('图表数据'!${col}:${col},{start}+{total}-{shown}+{k - 1})"
+        avg = lambda col, k=i: (f"AVERAGE(INDEX('图表数据'!${col}:${col},{start}+MAX(0,{total}-{shown}+{k - TREND_WINDOW})):"
+                                f"{src(col, k)})")
+        values = [f"=IF({have},{i},NA())", f"=IF({have},{src('C')},NA())", f"=IF({have},{src('D')},NA())",
+                  f"=IF({have},{src('E')},NA())", f"=IF({have},ROUND({avg('D')},2),NA())",
+                  f"=IF({have},ROUND({avg('E')},2),NA())"]
+        for col, (value, fmt) in enumerate(zip(values, formats)):
+            put(f"{'ABCDEF'[col]}{r}", value, fmt=fmt)
+    # #N/A 用白字藏起来（图需要 #N/A 才会跳过这些点）
+    trend.conditional_formatting.add(f"A{header + 1}:F{last}",
+                                     FormulaRule(formula=[f"ISNA(A{header + 1})"], font=Font(color="FFFFFF")))
+    for col, width in zip("ABCDEFG", [14, 13, 13, 10, 16, 16, 2]):  # G 列留空，隔开表和图
+        trend.column_dimensions[col].width = width
+    trend.column_dimensions["Z"].hidden = True
+    for r in (1, 2):
+        trend.row_dimensions[r].height = 22
+    trend.sheet_view.showGridLines = False
+    trend.freeze_panes = f"A{header + 1}"
+    for sheet in (trend, rank):  # 打印时横向、宽度缩到一页
+        sheet.page_setup.orientation = "landscape"
+        sheet.sheet_properties.pageSetUpPr.fitToPage = True
+        sheet.page_setup.fitToWidth, sheet.page_setup.fitToHeight = 1, 0
+
+    def line_chart(title, y_col, avg_col, values, step):
+        chart = ScatterChart()
+        chart.title = title
+        chart.title.overlay = False
+        chart.style = 13
+        xs = Reference(trend, min_col=1, min_row=header + 1, max_row=last)
+        for col, as_points in ((y_col, True), (avg_col, False)):
+            series = Series(Reference(trend, min_col=col, min_row=header, max_row=last), xs, title_from_data=True)
+            if as_points:
+                series.marker.symbol = "circle"
+                series.marker.size = 5
+                series.marker.graphicalProperties = GraphicalProperties(solidFill="4472C4")
+                series.marker.graphicalProperties.line.solidFill = "4472C4"
+                series.graphicalProperties.line.noFill = True
+            else:
+                series.marker.symbol = "none"
+                series.graphicalProperties.line.solidFill = "ED7D31"
+                series.graphicalProperties.line.width = 28000
+            series.smooth = False
+            chart.series.append(series)
+        low, high = axis_bounds(values, step)
+        chart.y_axis.scaling.min, chart.y_axis.scaling.max = low, high
+        chart.x_axis.scaling.min = 1
+        chart.x_axis.title = "第几局（从早到晚）"
+        chart.x_axis.delete = False
+        chart.y_axis.delete = False
+        chart.x_axis.title.overlay = False
+        chart.legend.position = "t"
+        chart.legend.overlay = False
+        chart.height, chart.width = 9, 22
+        return chart
+
+    all_ratings = [row["rating"] for _, row in games.values()]
+    all_cons = [row["ai_consistency"] for _, row in games.values() if isinstance(row.get("ai_consistency"), (int, float))]
+    trend.add_chart(line_chart("rating 走势（在 B1 换玩家）", 3, 5, all_ratings, 10), "H1")
+    if all_cons:
+        trend.add_chart(line_chart("AI 一致率走势 %", 4, 6, all_cons, 10), "H20")
+    wb.move_sheet(rank, offset=1 - wb.index(rank))
+    wb.active = 0
+
+
+OLD_CSV_RE = re.compile(r"^(?P<player>.+)_(?P<room>gold|jade|throne)_recent_(?P<n>\d+)_(?P<ver>v[\w.]+)\.csv$")
+OLD_ROOMS = {"gold": "金之间", "jade": "玉之间", "throne": "王座之间"}
+
+
+def parse_number(text):
+    match = re.search(r"-?\d+(?:\.\d+)?", str(text or ""))
+    return float(match.group(0)) if match else None
+
+
+def import_old_csv(folder):
+    """把旧版本生成的 CSV 导入 history.jsonl（只导入一次，按文件名去重）。"""
+    folder = Path(folder)
+    done = {r.get("import_file") for r in load_history()}
+    imported = 0
+    for path in sorted(folder.glob("*.csv")):
+        match = OLD_CSV_RE.match(path.name)
+        if not match or path.name in done:
+            continue
+        rows = []
+        with path.open(encoding="utf-8-sig", newline="") as f:
+            for rec in csv.DictReader(f):
+                paipu = rec.get("paipu") or paipu_from_mjai_href(rec.get("mjai_url") or "")
+                rating = parse_number(rec.get("rating"))
+                if not paipu or rating is None:
+                    continue
+                consistency = str(rec.get("ai_consistency") or "")
+                frac = re.search(r"(\d+)\s*/\s*(\d+)", consistency)
+                matches = rec.get("matches") or (f"{frac.group(1)}/{frac.group(2)}" if frac else "")
+                pct = re.search(r"([\d.]+)\s*%", consistency)
+                pct = float(pct.group(1)) if pct else parse_number(consistency)
+                if frac and int(frac.group(2)):
+                    pct = round(int(frac.group(1)) / int(frac.group(2)) * 100, 1)
+                json_url = rec.get("report_url") or rec.get("json_url") or ""
+                report = REPORT_RE.search(json_url)
+                rows.append({"paipu": paipu, "rating": rating, "ai_consistency": pct, "matches": matches,
+                             "report_url": f"{MJAI}/killerducky/?data={report.group(0)}" if report else ""})
+        if not rows:
+            continue
+        append_history({
+            "time": time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime)),
+            "player": match.group("player"),
+            "player_id": player_id_from_paipu(rows[0]["paipu"]),
+            "room": OLD_ROOMS[match.group("room")],
+            "games": int(match.group("n")),
+            "source": f"{match.group('ver')} CSV",
+            "import_file": path.name,
+            "rows": rows,
+        })
+        imported += 1
+    print(f"[import] 导入 {imported} 个 CSV")
+
+
 # ---------------------------------------------------------------- main
-
-def write_csv(path, rows):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in CSV_FIELDS})
-        ok = [r for r in rows if r.get("status") in ("OK", "cache")]
-        if ok:
-            writer.writerow({
-                "index": "均值",
-                "rating": round(sum(r["rating"] for r in ok) / len(ok), 2),
-                "ai_consistency": round(sum(r["ai_consistency"] for r in ok) / len(ok), 2),
-                "status": f"{len(ok)}/{len(rows)} 局",
-            })
-
 
 def parse_args():
     ap = argparse.ArgumentParser(description=f"查rt工具 {VERSION}")
@@ -551,12 +940,22 @@ def parse_args():
     ap.add_argument("--refresh", action="store_true", help="忽略缓存，全部重新提交")
     ap.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL,
                     help=f"同时在 mjai 上处理几局，默认 {DEFAULT_PARALLEL}；遇到限流会自动减少")
+    ap.add_argument("--export", action="store_true", help="只重新生成 rt结果.xlsx，不查询")
+    ap.add_argument("--import-csv", metavar="文件夹", help="把旧版本的 CSV 导入总表，然后退出")
     return ap.parse_args()
 
 
 def main():
     started = time.time()
     args = parse_args()
+    if args.import_csv:
+        import_old_csv(args.import_csv)
+        export_excel()
+        return
+    if args.export:
+        export_excel()
+        return
+
     nickname = args.nickname or (None if args.player_id else input("昵称: ").strip())
     room = args.room or input("房间 (9=金之间, 12=玉之间, 16=王座之间): ").strip()
     games = args.games or int(input("最近几局: ").strip())
@@ -567,10 +966,14 @@ def main():
             player_id = search_player(nickname)
         except urllib.error.HTTPError as exc:
             print(f"[error] 牌谱屋搜玩家失败：HTTP {exc.code}（429 是限流，可以稍后再试）")
+        if not player_id:
+            player_id = known_player(nickname=nickname)[1]
+            if player_id:
+                print(f"[player] 用查询记录里的玩家 ID {player_id}")
     if not player_id:
         print("[error] 没找到玩家，可以用 --player-id 指定")
         return
-    nickname = nickname or player_id
+    nickname = nickname or known_player(player_id=player_id)[0] or str(player_id)
     print(f"[player] {nickname} id={player_id}")
 
     cache = ReportCache(CACHE_FILE)
@@ -578,6 +981,7 @@ def main():
     driver = build_driver()
     print(f"[time] Chrome 启动 {time.time() - t0:.1f}s")
     rows = {}
+    paipus = []
     runner = None
     try:
         t0 = time.time()
@@ -586,8 +990,6 @@ def main():
         if not paipus:
             print("[error] 牌谱屋没有读到对局")
             return
-        safe_name = re.sub(r'[\\/:*?"<>|]+', "_", nickname)
-        out = OUTPUT_DIR / f"{safe_name}_{ROOM_NAMES.get(room, room)}_recent_{games}_{VERSION}.csv"
 
         jobs = []
         for idx, paipu in enumerate(paipus, 1):
@@ -607,9 +1009,7 @@ def main():
             else:
                 rows[idx] = {"index": idx, "paipu": paipu, "status": f"ERROR: {error}"}
                 print(f"[#{idx}] 失败: {error}")
-            write_csv(out, [rows[i] for i in sorted(rows)])
 
-        write_csv(out, [rows[i] for i in sorted(rows)])
         if jobs:
             t0 = time.time()
             runner = MjaiRunner(driver, args.model, args.parallel)
@@ -620,14 +1020,26 @@ def main():
             driver.quit()
         except Exception:
             pass
+        if rows:
+            # 中途中断也把已完成的局记下来
+            keep = ("paipu", "rating", "ai_consistency", "matches", "report_url", "status")
+            append_history({
+                "time": time.strftime("%Y-%m-%d %H:%M"),
+                "player": nickname,
+                "player_id": str(player_id),
+                "room": ROOM_NAMES.get(room, room),
+                "games": games,
+                "model": args.model,
+                "source": VERSION,
+                "rows": [{k: rows[i].get(k) for k in keep} for i in sorted(rows)],
+            })
+            export_excel()
 
-    rows = [rows[i] for i in sorted(rows)]
-    ok = [r for r in rows if r.get("status") in ("OK", "cache")]
-    print(f"\n[done] {out}")
+    ok = [rows[i] for i in sorted(rows) if rows[i].get("status") in ("OK", "cache")]
     if ok:
-        print(f"[done] rating 均值 {sum(r['rating'] for r in ok) / len(ok):.2f}，"
-              f"一致率均值 {sum(r['ai_consistency'] for r in ok) / len(ok):.2f}%，"
-              f"成功 {len(ok)}/{len(rows)}，缓存命中 {sum(r['status'] == 'cache' for r in rows)}")
+        print(f"[done] rating 均值 {mean([r['rating'] for r in ok])}，"
+              f"一致率均值 {mean([r['ai_consistency'] for r in ok])}%，"
+              f"成功 {len(ok)}/{len(rows)}，缓存命中 {sum(r['status'] == 'cache' for r in ok)}")
     if runner:
         print(f"[done] 并行 {args.parallel}，限流 {runner.rate_limited} 次，最后并行 {runner.limit}")
     print(f"[done] 用时 {time.time() - started:.0f}s")
