@@ -56,6 +56,7 @@ python 查rt工具.py --nickname "玩家昵称" --room 12 --games 20
 ├─ rt结果.xlsx      总结果表
 ├─ data/            运行数据，不要手动改
 │  ├─ chrome_profile/   浏览器配置（含 Cloudflare 验证状态）
+│  ├─ driver/           修补好的 chromedriver，按 Chrome 大版本缓存，免得每次启动都重新下载
 │  ├─ reports.jsonl     按 牌谱ID+模型 缓存的分析结果
 │  └─ history.jsonl     每次查询的记录，rt结果.xlsx 由它生成
 └─ old/             旧版本脚本、实验文件、旧浏览器配置和旧 CSV（不上传）

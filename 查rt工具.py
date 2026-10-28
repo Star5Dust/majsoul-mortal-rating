@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -29,10 +30,11 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 
 
-VERSION = "v6.3"
+VERSION = "v6.4"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 PROFILE_DIR = DATA_DIR / "chrome_profile"
+DRIVER_DIR = DATA_DIR / "driver"  # 修补好的 chromedriver，按 Chrome 大版本缓存
 CACHE_FILE = DATA_DIR / "reports.jsonl"  # 按 牌谱ID+模型 缓存的分析结果
 HISTORY_FILE = DATA_DIR / "history.jsonl"  # 每次查询一行，rt结果.xlsx 由它生成
 EXCEL_FILE = BASE_DIR / "rt结果.xlsx"
@@ -169,28 +171,48 @@ def get_chrome_major_version():
     return None
 
 
-def build_driver():
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+def chrome_options():
     options = uc.ChromeOptions()
     options.add_argument(f"--user-data-dir={PROFILE_DIR}")
     options.add_argument("--profile-directory=Default")
     options.add_argument("--lang=zh-CN")
     options.add_argument("--no-first-run")
     options.add_argument("--window-size=1100,800")
+    return options
+
+
+def build_driver():
+    """undetected_chromedriver 默认每次启动都重新下载 chromedriver（几秒到一分多钟），
+    所以第一次下载修补好后按 Chrome 大版本存到 data/driver/，以后直接用；Chrome 升级后自动重新下载。"""
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     major = get_chrome_major_version()
+    cached = DRIVER_DIR / f"chromedriver_{major}.exe" if major else None
     last_exc = None
     for attempt in range(1, 4):
+        use_cached = bool(cached and cached.exists())
         try:
-            if major:
-                driver = uc.Chrome(options=options, use_subprocess=True, version_main=major)
+            if use_cached:
+                driver = uc.Chrome(options=chrome_options(), use_subprocess=True, version_main=major,
+                                   driver_executable_path=str(cached))
+            elif major:
+                driver = uc.Chrome(options=chrome_options(), use_subprocess=True, version_main=major)
             else:
-                driver = uc.Chrome(options=options, use_subprocess=True)
+                driver = uc.Chrome(options=chrome_options(), use_subprocess=True)
+            if cached and not use_cached:
+                try:
+                    DRIVER_DIR.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(driver.patcher.executable_path, cached)
+                except (OSError, AttributeError) as exc:
+                    print(f"[warn] 保存 chromedriver 失败（下次还会重新下载）: {exc}")
             driver.set_page_load_timeout(60)
             driver.set_script_timeout(240)
             return driver
         except Exception as exc:
             last_exc = exc
             print(f"[warn] Chrome 启动失败 {attempt}/3: {exc.__class__.__name__}")
+            if use_cached:
+                # 缓存的驱动可能坏了或和 Chrome 不匹配，删掉下次重新下载
+                cached.unlink(missing_ok=True)
             time.sleep(3 * attempt)
     raise last_exc
 
