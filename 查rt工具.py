@@ -2,7 +2,7 @@
 """
 查rt工具 v6
 
-1. 牌谱屋接口按昵称搜玩家 ID（纯 HTTP）；接口要验证码时让用户在 Chrome 里用网页搜，读玩家页网址里的 ID
+1. 牌谱屋接口按昵称搜玩家 ID（纯 HTTP）；接口要验证码时改在 Chrome 里用牌谱屋网页搜索框搜，读玩家页网址里的 ID
 2. 一个 Chrome 打开牌谱屋玩家页，读最近 N 局的牌谱 ID
 3. 已查过的牌谱直接用本地缓存 cache/reports.jsonl
 4. 没查过的：同一个 mjai 表单页里循环提交（等 Turnstile token -> 页内 POST -> 重置 Turnstile）
@@ -26,6 +26,7 @@ from pathlib import Path
 
 import undetected_chromedriver as uc
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.common.by import By
 
 
 VERSION = "v6.3"
@@ -244,11 +245,44 @@ def paipu_from_mjai_href(href):
     return urllib.parse.parse_qs(urllib.parse.urlparse(target).query).get("paipu", [None])[0]
 
 
+JS_AMAE_OPTIONS = """
+return Array.from(document.querySelectorAll('ul[role="listbox"] li')).map(li => li.innerText.trim());
+"""
+
+
 def pick_player_in_browser(driver, nickname):
-    """接口搜不了时，让用户在 Chrome 里用牌谱屋网页自己搜，点进玩家页后读网址里的 ID。"""
+    """接口搜不了时，在 Chrome 里用牌谱屋首页的搜索框搜（和 v5 一样），点进玩家页后读网址里的 ID。
+    自动搜索没成功就请用户在浏览器里手动搜并点进玩家页。"""
     open_page(driver, AMAE_SITE)
-    beep()
-    print(f"[player] 请在打开的浏览器里搜索「{nickname}」并点进他的主页，程序会自动读取玩家 ID（Ctrl+C 退出）")
+    print(f"[player] 在牌谱屋网页上搜索「{nickname}」")
+    deadline = time.time() + 20
+    box = None
+    while time.time() < deadline and not box:
+        try:
+            boxes = driver.find_elements(By.CSS_SELECTOR, "input[role='combobox'], input[type='text']")
+            box = next((b for b in boxes if b.is_displayed()), None)
+        except WebDriverException:
+            pass
+        time.sleep(0.5)
+    if box:
+        try:
+            box.clear()
+            box.send_keys(nickname)
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                options = driver.execute_script(JS_AMAE_OPTIONS) or []
+                if options:
+                    # 下拉项文字里带段位等信息，优先选昵称完全一致的那一项
+                    pick = next((i for i, text in enumerate(options) if text.split("\n")[0].strip() == nickname),
+                                next((i for i, text in enumerate(options) if nickname in text), 0))
+                    driver.find_elements(By.CSS_SELECTOR, 'ul[role="listbox"] li')[pick].click()
+                    break
+                time.sleep(0.5)
+        except WebDriverException as exc:
+            print(f"[warn] 自动搜索出错: {exc.__class__.__name__}")
+
+    started = time.time()
+    prompted = False
     while True:
         try:
             player_id = player_id_from_url(driver.current_url)
@@ -256,6 +290,11 @@ def pick_player_in_browser(driver, nickname):
             player_id = None
         if player_id:
             return player_id
+        if not prompted and time.time() - started > 10:
+            beep()
+            print(f"[player] 没能自动进入玩家页。请在浏览器里搜索「{nickname}」并点进他的主页"
+                  "（有人机验证就手动点一下），程序会自动读取玩家 ID（Ctrl+C 退出）")
+            prompted = True
         time.sleep(0.5)
 
 
