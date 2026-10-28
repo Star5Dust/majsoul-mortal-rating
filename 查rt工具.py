@@ -2,7 +2,7 @@
 """
 查rt工具 v6
 
-1. 牌谱屋接口按昵称搜玩家 ID（纯 HTTP）
+1. 牌谱屋接口按昵称搜玩家 ID（纯 HTTP）；接口要验证码时改在 Chrome 里用牌谱屋网页搜索框搜，读玩家页网址里的 ID
 2. 一个 Chrome 打开牌谱屋玩家页，读最近 N 局的牌谱 ID
 3. 已查过的牌谱直接用本地缓存 cache/reports.jsonl
 4. 没查过的：同一个 mjai 表单页里循环提交（等 Turnstile token -> 页内 POST -> 重置 Turnstile）
@@ -26,9 +26,10 @@ from pathlib import Path
 
 import undetected_chromedriver as uc
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.common.by import By
 
 
-VERSION = "v6.2"
+VERSION = "v6.3"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 PROFILE_DIR = DATA_DIR / "chrome_profile"
@@ -57,9 +58,19 @@ def http_get_json(url, timeout=30):
         return json.loads(resp.read().decode("utf-8"))
 
 
+class SearchBlocked(Exception):
+    """牌谱屋搜玩家接口要验证码（x-cap-token-required），纯 HTTP 搜不了。"""
+
+
 def search_player(nickname):
     url = f"{AMAE_API}/search_player/{urllib.parse.quote(nickname)}?limit=10"
-    players = http_get_json(url)
+    try:
+        players = http_get_json(url)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        if "cap-token" in body or "CAPTCHA" in body:
+            raise SearchBlocked() from exc
+        raise
     exact = [p for p in players if p.get("nickname") == nickname]
     if len(exact) == 1:
         return str(exact[0]["id"])
@@ -69,6 +80,12 @@ def search_player(nickname):
     for p in players:
         print(f"  id={p.get('id')}  {p.get('nickname')}")
     return None
+
+
+def player_id_from_url(text):
+    """牌谱屋玩家页网址 .../player/18591884/12 -> 18591884"""
+    match = re.search(r"/player/(\d+)", text or "")
+    return match.group(1) if match else None
 
 
 def encode_account_id(player_id):
@@ -226,6 +243,59 @@ def paipu_from_mjai_href(href):
     """https://mjai.ekyu.moe/zh-cn.html?url=https%3A...%3Fpaipu%3D<paipu> -> <paipu>"""
     target = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("url", [""])[0]
     return urllib.parse.parse_qs(urllib.parse.urlparse(target).query).get("paipu", [None])[0]
+
+
+JS_AMAE_OPTIONS = """
+return Array.from(document.querySelectorAll('ul[role="listbox"] li')).map(li => li.innerText.trim());
+"""
+
+
+def pick_player_in_browser(driver, nickname):
+    """接口搜不了时，在 Chrome 里用牌谱屋首页的搜索框搜（和 v5 一样），点进玩家页后读网址里的 ID。
+    自动搜索没成功就请用户在浏览器里手动搜并点进玩家页。"""
+    open_page(driver, AMAE_SITE)
+    print(f"[player] 在牌谱屋网页上搜索「{nickname}」")
+    deadline = time.time() + 20
+    box = None
+    while time.time() < deadline and not box:
+        try:
+            boxes = driver.find_elements(By.CSS_SELECTOR, "input[role='combobox'], input[type='text']")
+            box = next((b for b in boxes if b.is_displayed()), None)
+        except WebDriverException:
+            pass
+        time.sleep(0.5)
+    if box:
+        try:
+            box.clear()
+            box.send_keys(nickname)
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                options = driver.execute_script(JS_AMAE_OPTIONS) or []
+                if options:
+                    # 下拉项文字里带段位等信息，优先选昵称完全一致的那一项
+                    pick = next((i for i, text in enumerate(options) if text.split("\n")[0].strip() == nickname),
+                                next((i for i, text in enumerate(options) if nickname in text), 0))
+                    driver.find_elements(By.CSS_SELECTOR, 'ul[role="listbox"] li')[pick].click()
+                    break
+                time.sleep(0.5)
+        except WebDriverException as exc:
+            print(f"[warn] 自动搜索出错: {exc.__class__.__name__}")
+
+    started = time.time()
+    prompted = False
+    while True:
+        try:
+            player_id = player_id_from_url(driver.current_url)
+        except WebDriverException:
+            player_id = None
+        if player_id:
+            return player_id
+        if not prompted and time.time() - started > 10:
+            beep()
+            print(f"[player] 没能自动进入玩家页。请在浏览器里搜索「{nickname}」并点进他的主页"
+                  "（有人机验证就手动点一下），程序会自动读取玩家 ID（Ctrl+C 退出）")
+            prompted = True
+        time.sleep(0.5)
 
 
 def fetch_recent_paipu(driver, player_id, room, games):
@@ -956,27 +1026,25 @@ def main():
         export_excel()
         return
 
-    nickname = args.nickname or (None if args.player_id else input("昵称: ").strip())
+    nickname = args.nickname or (None if args.player_id else input("昵称（或牌谱屋玩家页网址）: ").strip())
     room = args.room or input("房间 (9=金之间, 12=玉之间, 16=王座之间): ").strip()
     games = args.games or int(input("最近几局: ").strip())
 
-    player_id = args.player_id
+    player_id = player_id_from_url(args.player_id) or args.player_id
+    if not player_id and player_id_from_url(nickname):
+        player_id, nickname = player_id_from_url(nickname), None
     if not player_id:
         try:
             player_id = search_player(nickname)
+        except SearchBlocked:
+            print("[player] 牌谱屋搜玩家接口要验证码，纯 HTTP 搜不了")
         except urllib.error.HTTPError as exc:
-            print(f"[error] 牌谱屋搜玩家失败：HTTP {exc.code}（429 是限流，可以稍后再试）")
+            print(f"[error] 牌谱屋搜玩家失败：HTTP {exc.code}")
         if not player_id:
             player_id = known_player(nickname=nickname)[1]
             if player_id:
                 print(f"[player] 用查询记录里的玩家 ID {player_id}")
-    if not player_id:
-        print("[error] 没找到玩家，可以用 --player-id 指定")
-        return
-    nickname = nickname or known_player(player_id=player_id)[0] or str(player_id)
-    print(f"[player] {nickname} id={player_id}")
 
-    cache = ReportCache(CACHE_FILE)
     t0 = time.time()
     driver = build_driver()
     print(f"[time] Chrome 启动 {time.time() - t0:.1f}s")
@@ -984,6 +1052,11 @@ def main():
     paipus = []
     runner = None
     try:
+        if not player_id:
+            player_id = pick_player_in_browser(driver, nickname)
+        nickname = nickname or known_player(player_id=player_id)[0] or str(player_id)
+        print(f"[player] {nickname} id={player_id}")
+        cache = ReportCache(CACHE_FILE)
         t0 = time.time()
         paipus = fetch_recent_paipu(driver, player_id, room, games)
         print(f"[time] 牌谱屋列表 {time.time() - t0:.1f}s")
